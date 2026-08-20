@@ -25,6 +25,7 @@ from app.config import QUESTION_CONTINUATION_SECONDS
 from app.vad import UtteranceBuffer
 from app.llm import ollama_client
 from app.rag import indexing, qa, questions, transcripts
+from app.tasks import extract_meeting
 from app.rag.qa import DEFAULT_MIN_SCORE, DEFAULT_TOP_K
 from app.rag.retrieve import retrieve
 
@@ -577,6 +578,69 @@ async def index_meeting_endpoint(meeting_id: str):
         return await asyncio.to_thread(work)
     except ValueError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+# --- Tasks (Sprint 4) ----------------------------------------------------
+
+class TaskStatusRequest(BaseModel):
+    status: str
+
+
+@app.get("/api/v1/meetings/{meeting_id}/tasks")
+def list_tasks(meeting_id: str):
+    """Action items already extracted from this meeting."""
+    conn = db.init_db()
+    try:
+        return {"meeting_id": meeting_id,
+                "tasks": [dict(row) for row in db.get_tasks(conn, meeting_id)]}
+    finally:
+        conn.close()
+
+
+@app.post("/api/v1/meetings/{meeting_id}/tasks")
+async def extract_tasks(meeting_id: str):
+    """Extract action items from a meeting's transcript.
+
+    Slow -- one model call per window, minutes on a long meeting -- and
+    entirely blocking, so it runs on a worker thread. A production version
+    would return 202 with a job id rather than holding the request open;
+    this keeps it synchronous because a script and a curl are the only
+    clients, and a job queue with one consumer is machinery without a
+    purpose.
+    """
+    def work() -> dict:
+        conn = db.init_db()
+        try:
+            result = extract_meeting(conn, meeting_id)
+            result["tasks"] = [dict(row) for row in db.get_tasks(conn, meeting_id)]
+            return result
+        finally:
+            conn.close()
+
+    try:
+        return await asyncio.to_thread(work)
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ollama_client.OllamaError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+
+
+@app.patch("/api/v1/tasks/{task_id}")
+def update_task(task_id: str, request: TaskStatusRequest):
+    """Mark a task done, or reopen it."""
+    allowed = {"open", "done", "cancelled"}
+    if request.status not in allowed:
+        raise HTTPException(
+            status_code=422,
+            detail=f"status must be one of {sorted(allowed)}")
+
+    conn = db.init_db()
+    try:
+        if not db.set_task_status(conn, task_id, request.status):
+            raise HTTPException(status_code=404, detail="task not found")
+        return {"id": task_id, "status": request.status}
+    finally:
+        conn.close()
 
 
 @app.post("/api/v1/search")

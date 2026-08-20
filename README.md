@@ -71,7 +71,7 @@ can seek to: `Special General Meeting @ 33:46-35:05`.
 | 2.5 | Transcripts indexed alongside documents, in one shared index | **Done** |
 | 3 | Real-time Q&amp;A during a live meeting | **Done** |
 | — | Voice-activity detection: cut audio at pauses, not on a clock | **Done** |
-| 4 | Action-item extraction into structured tasks | Not started |
+| 4 | Action-item extraction into structured tasks | **Done** |
 | 5 | Authentication, frontend | Not started |
 
 ## Stack
@@ -132,6 +132,24 @@ voice-activity detection, so transcript arrives when someone stops speaking
 rather than on a fixed cadence. On the same 90 seconds of meeting audio that
 halves the number of low-confidence segments (see §18 of the design notes).
 
+### Extract action items
+
+```bash
+python -m scripts.extract_tasks --list
+python -m scripts.extract_tasks <meeting_id>
+python -m scripts.extract_tasks <meeting_id> --show   # re-read without re-running
+```
+
+Every task carries the verbatim transcript line it came from and the moment
+it was said, because a task list you cannot check against the recording is a
+list you have to take on faith. The quote is also **verified in code** —
+if the sentence is not in the transcript, the task is discarded.
+
+That guard matters more than it looks. On six windows of a governance
+discussion containing no action items at all, a naive prompt returned **33**
+of them; the prompt in [app/tasks.py](app/tasks.py) returned **0**. See §19
+of the design notes.
+
 ### Ask a question during the meeting
 
 Two ways. Say it out loud, if the recording contains a wake phrase:
@@ -183,6 +201,24 @@ time. They are grouped into windows bounded by size, by elapsed time, and by
 silence, with segments below a confidence floor dropped. A 53-minute meeting
 of 723 segments becomes 52 windows.
 
+### Extract action items
+
+```bash
+python -m scripts.extract_tasks --list
+python -m scripts.extract_tasks <meeting_id>
+python -m scripts.extract_tasks <meeting_id> --show   # re-read without re-running
+```
+
+Every task carries the verbatim transcript line it came from and the moment
+it was said, because a task list you cannot check against the recording is a
+list you have to take on faith. The quote is also **verified in code** —
+if the sentence is not in the transcript, the task is discarded.
+
+That guard matters more than it looks. On six windows of a governance
+discussion containing no action items at all, a naive prompt returned **33**
+of them; the prompt in [app/tasks.py](app/tasks.py) returned **0**. See §19
+of the design notes.
+
 ### Ask a question
 
 ```bash
@@ -221,6 +257,12 @@ curl -X POST localhost:8000/api/v1/search \
 
 # Make a meeting searchable
 curl -X POST localhost:8000/api/v1/meetings/<uuid>/index
+
+# Action items
+curl -X POST localhost:8000/api/v1/meetings/<uuid>/tasks   # extract
+curl localhost:8000/api/v1/meetings/<uuid>/tasks           # read
+curl -X PATCH localhost:8000/api/v1/tasks/<uuid> \
+  -H 'content-type: application/json' -d '{"status": "done"}'
 ```
 
 Interactive docs at `http://localhost:8000/docs`.
@@ -250,8 +292,8 @@ being read from while the model is still writing.
 pytest tests/ -q
 ```
 
-65 tests covering the document chunker, the transcript windower, question
-detection, audio segmentation, and the database schema — the deterministic parts. Model behaviour is not
+100 tests covering the document chunker, the transcript windower, question
+detection, audio segmentation, action-item verification, and the schema — the deterministic parts. Model behaviour is not
 unit-tested; that belongs in evaluation against a labelled question set,
 which is a separate discipline.
 
@@ -268,6 +310,7 @@ matters more than recall for a thing that interrupts a meeting.
 app/
   config.py            paths, model names, chunk sizes — one source of truth
   vad.py               cutting the audio stream into utterances at pauses
+  tasks.py             extracting action items, and verifying they are real
   db.py                schema and all SQL for the core tables
   asr.py               Whisper loading and transcription
   server.py            FastAPI app: WebSocket + REST endpoints

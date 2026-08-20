@@ -635,6 +635,115 @@ it to.
 
 ---
 
+## 19. Extracting action items is a precision problem too
+
+Asking a model to list the action items in a passage works on the first
+try. The problem is that it works just as readily when there are none.
+
+Meetings are full of language that sounds like commitment and is not — "we
+should probably look at that", "someone ought to check". A model asked to
+find tasks will find them. And a task list with three invented entries is
+worse than no task list, because every line has to be checked against the
+recording, which is the work it was supposed to save.
+
+### The measurement
+
+Six windows of the governance meeting in this repository — a discussion
+about board appointments, containing no action items at all:
+
+| prompt | items returned | with a quote not in the transcript |
+|---|---|---|
+| "Extract the action items from this transcript." | **33** | 2 |
+| the restrained prompt in `app/tasks.py` | **0** | 0 |
+
+Thirty-three fabricated commitments from one meeting's worth of debate. The
+restraint is not decoration; it is most of the feature. The prompt names
+what *not* to extract, and says explicitly that an empty list is a correct
+and useful answer — because a model that believes it has failed by
+returning nothing will find something.
+
+### Quotes make the claim checkable
+
+Every task must come with a quote copied verbatim from the transcript, and
+the quote is then checked against the source **in code**. No match, no task.
+
+That is the load-bearing part. A model that invents a task must also invent
+the sentence it came from, and an invented sentence is not in the
+transcript. It converts an unfalsifiable claim into one the program can test
+for itself — the same shape as the relevance floor in §6: a rule enforced in
+code, not a request made in a prompt.
+
+Two details that matter:
+
+- **Comparison is on normalised text.** Models tidy punctuation and
+  capitalisation while copying, even when told not to. Rejecting a genuine
+  quote over a comma would throw away real tasks.
+- **A word-count floor.** "I will do that" verifies perfectly and appears in
+  almost every meeting. Word count stands in for specificity: below five
+  words, matching the transcript is not evidence of anything.
+
+### Structured output constrains shape, not content
+
+Ollama takes a JSON schema in `format` and constrains decoding to it — at
+each step the sampler is restricted to tokens that can still produce a valid
+document. The result is *guaranteed* to parse and to have the declared
+shape. That is categorically stronger than asking nicely and retrying.
+
+It guarantees nothing about the values. Asked for a deadline that was never
+mentioned, a constrained model does not return malformed JSON — it returns
+`due: "soon"`, because the schema said a string goes there. Observed
+directly, along with `assignee: "Unassigned (volunteer)"`.
+
+So a nullable field needs a schema that permits null, a prompt that asks for
+null, **and** a pass in code that turns the model's stand-ins back into
+null. All three, because the first two demonstrably do not suffice.
+
+**Structured output removes parsing errors, not hallucination.**
+
+### On the real meeting, it found two things
+
+Twenty-three windows of a 53-minute governance debate produced two action
+items, both from garbled transcript. That looks like a weak result and is
+probably close to correct: the meeting was a discussion about mandate and
+finances, not a project stand-up. The 33-vs-0 comparison above is what makes
+that credible rather than merely hopeful.
+
+Verified against a meeting that does contain tasks — a synthetic stand-up
+with four explicit commitments and one deliberate distractor ("it would be
+good to look at that at some point, but nothing is decided yet") — it found
+all four, with assignees and deadlines, and left the distractor alone.
+
+### The bug in locating a quote
+
+A task said 26 seconds in was stored at 0:00. Its quote straddled two
+segments, and neither contained the other:
+
+```
+segment: "...nothing is decided yet. One more thing, Naomi, please
+          update the on call"
+segment: "rota before the end of the month. Understood, I will do that."
+quote:   "Naomi, please update the on call rota before the end of the month."
+```
+
+Both containment tests failed, so it fell back to the whole window.
+
+The first fix — the fraction of a segment's words appearing anywhere in the
+quote — failed on the very case it was written for: those two segments score
+0.43 and 0.58 against a 0.6 bar, because each carries a trailing clause the
+quote does not. **Set overlap counts scattered words, so it is diluted by
+exactly the extra text that makes the case hard**, and raising the threshold
+would have made it worse.
+
+A contiguous run is the right signal. Six words in a row in the same order
+is a quotation; sharing "the" and "of" six times over is not. Those segments
+share runs of six and seven words.
+
+The lesson is about the metric, not the threshold: when a similarity measure
+fails, check whether it is measuring the thing that actually distinguishes
+the cases before reaching for a different cutoff.
+
+---
+
 ## Known limitations
 
 Worth being able to name unprompted — being asked "what would you fix
@@ -667,21 +776,35 @@ first?" and having a real answer is worth more than an unbroken defence.
    recordings here, but a noisy room or a distant microphone would want it
    lower, and there is no calibration step or per-connection adaptation.
 
-6. **Indexing transcripts is a manual step.** `scripts/index_transcripts.py`
+6. **Assignees are names, not people.** `tasks.assignee` holds the name as
+   spoken ("Karen", "the treasurer"). The architecture document specifies a
+   foreign key to a users table, which needs both a users table and speaker
+   diarization to resolve a name to a person. Neither exists.
+
+7. **Deadlines are phrases, not dates.** `due` stores "before Friday" as
+   said. Parsing it needs the meeting's date and a decision about which
+   Friday, and a wrong date looks authoritative in a way a wrong phrase
+   does not.
+
+8. **Extraction is slow.** One model call per window, several minutes on a
+   50-minute meeting, and it holds the HTTP request open. A production
+   version would return 202 and a job id.
+
+9. **Indexing transcripts is a manual step.** `scripts/index_transcripts.py`
    has to be run after a meeting. In a product this would be triggered by
    the WebSocket disconnecting. It is manual here because re-running it on
    demand is what you need while tuning the window size or the confidence
    floor.
 
-7. **Near-duplicate meetings are not detected.** The same audio transcribed
+10. **Near-duplicate meetings are not detected.** The same audio transcribed
    twice produces two meetings whose chunks are near-identical, and they
    will fill the top-k with the same passage twice. Handled by hand here (one
    of the two is simply not indexed). A real fix would deduplicate on
    content similarity at ingest time.
 
-8. **No evaluation set.** Retrieval quality is assessed by trying queries
+11. **No evaluation set.** Retrieval quality is assessed by trying queries
    and looking at the output. That is fine for development and not fine as
    a claim of quality. A labelled question→passage set with recall@k is what
    would turn tuning from guesswork into measurement.
 
-9. **No authentication.** Sprint 5. Every endpoint is currently open.
+12. **No authentication.** Sprint 5. Every endpoint is currently open.

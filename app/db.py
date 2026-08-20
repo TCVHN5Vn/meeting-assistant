@@ -119,6 +119,43 @@ CREATE TABLE IF NOT EXISTS rag_chunks (
     created_at   TEXT
 );
 
+CREATE TABLE IF NOT EXISTS tasks (
+    id           TEXT PRIMARY KEY,
+    meeting_id   TEXT REFERENCES meetings(id),
+    description  TEXT NOT NULL,
+
+    -- The assignee's name AS SPOKEN, not a foreign key to a users table.
+    -- The architecture document specifies assigned_to UUID REFERENCES
+    -- users(id), which needs two things this system does not have: a users
+    -- table, and speaker diarization to know who was talking. Resolving
+    -- "Karen" to a person is a separate problem, and storing the raw name
+    -- now keeps the transcript's own evidence intact for whenever it is
+    -- solved. NULL when nobody was named.
+    assignee     TEXT,
+    -- Also as spoken: "before Friday", "next meeting". Deliberately not
+    -- parsed into a DATE. "Friday" means nothing without knowing the
+    -- meeting's date and which Friday was meant, and a wrong date looks
+    -- authoritative in a way that a wrong phrase does not.
+    due          TEXT,
+
+    status       TEXT DEFAULT 'open',
+
+    -- The verbatim transcript line the task was extracted from, and where
+    -- it was said. Together these are what make a task checkable: you can
+    -- read the sentence and go and listen to it. An extracted task with no
+    -- provenance is an assertion.
+    quote        TEXT,
+    start_ts     REAL,
+    end_ts       REAL,
+
+    -- Which model and prompt produced it, so a bad run can be identified
+    -- and re-run without wondering which rows came from where.
+    detected_by  TEXT,
+    created_at   TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_tasks_meeting ON tasks(meeting_id, start_ts);
+
 CREATE INDEX IF NOT EXISTS idx_ragchunks_vector ON rag_chunks(vector_id);
 CREATE INDEX IF NOT EXISTS idx_ragchunks_source ON rag_chunks(source_type, source_id);
 """
@@ -215,3 +252,44 @@ def get_transcript(conn: sqlite3.Connection, meeting_id: str) -> list[sqlite3.Ro
            ORDER BY start_ts""",
         (meeting_id,),
     ).fetchall()
+
+
+# --- Tasks --------------------------------------------------------------
+
+def insert_task(conn, task_id, meeting_id, description, assignee, due,
+                quote, start_ts, end_ts, detected_by) -> None:
+    conn.execute(
+        """INSERT INTO tasks (id, meeting_id, description, assignee, due,
+                              status, quote, start_ts, end_ts, detected_by, created_at)
+           VALUES (?, ?, ?, ?, ?, 'open', ?, ?, ?, ?, ?)""",
+        (task_id, meeting_id, description, assignee, due,
+         quote, start_ts, end_ts, detected_by, utc_now()),
+    )
+
+
+def get_tasks(conn, meeting_id: str) -> list[sqlite3.Row]:
+    """Tasks for one meeting, in the order they were raised."""
+    return conn.execute(
+        """SELECT id, description, assignee, due, status, quote,
+                  start_ts, end_ts, detected_by, created_at
+           FROM tasks WHERE meeting_id = ? ORDER BY start_ts""",
+        (meeting_id,),
+    ).fetchall()
+
+
+def clear_tasks(conn, meeting_id: str) -> int:
+    """Remove a meeting's tasks. Re-extraction replaces rather than appends.
+
+    Without this, running extraction twice doubles every task -- and the
+    second run is exactly what you do after changing the prompt.
+    """
+    cursor = conn.execute("DELETE FROM tasks WHERE meeting_id = ?", (meeting_id,))
+    conn.commit()
+    return cursor.rowcount
+
+
+def set_task_status(conn, task_id: str, status: str) -> bool:
+    cursor = conn.execute(
+        "UPDATE tasks SET status = ? WHERE id = ?", (status, task_id))
+    conn.commit()
+    return cursor.rowcount > 0

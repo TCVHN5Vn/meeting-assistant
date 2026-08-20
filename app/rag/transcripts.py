@@ -29,7 +29,7 @@ metadata carried through.
 """
 
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from app.config import (
     MIN_ASR_CONFIDENCE,
@@ -48,6 +48,12 @@ class TranscriptWindow:
     start_ts: float
     end_ts: float
     segment_count: int
+
+    # The rows this window was built from. Retrieval does not need them --
+    # it wants the joined text -- but action-item extraction does: a quoted
+    # sentence has to be traced back to the moment it was said, and only
+    # the individual segments carry timestamps that precise.
+    segments: list = field(default_factory=list)
 
 
 def window_segments(
@@ -107,6 +113,7 @@ def window_segments(
             start_ts=current[0]["start_ts"],
             end_ts=current[-1]["end_ts"],
             segment_count=len(current),
+            segments=list(current),
         ))
 
     def carry_over() -> list:

@@ -87,6 +87,63 @@ def chat(
     return response.json()["message"]["content"].strip()
 
 
+def chat_json(
+    system: str,
+    user: str,
+    schema: dict,
+    timeout: float = 300.0,
+) -> dict:
+    """Ask for a response that satisfies a JSON schema, and parse it.
+
+    Ollama's `format` field takes a JSON schema and CONSTRAINS DECODING to
+    it -- at each step the sampler is restricted to tokens that can still
+    lead to a valid document. So the result is guaranteed to parse and to
+    have the declared shape. That is categorically stronger than asking
+    nicely in the prompt and retrying on failure, which is what you are
+    stuck with against an API that has no such feature.
+
+    What it does NOT guarantee is that the CONTENT is true. The shape is
+    enforced; the values are still generated. Asked for a due date that
+    was never mentioned, a constrained model will not return malformed
+    JSON -- it will invent a plausible date, because the schema said a
+    string goes there. Observed in practice: a task with no stated deadline
+    came back with due="soon".
+
+    Which is the general lesson. Structured output removes parsing errors,
+    not hallucination. Verification still has to happen afterwards, in
+    code -- see verify_quote in app/tasks.py.
+
+    temperature=0.0 rather than the 0.1 used elsewhere: extraction should
+    be reproducible, so that a changed result means a changed prompt.
+    """
+    response = _post(
+        "/api/chat",
+        {
+            "model": OLLAMA_MODEL,
+            "messages": [
+                {"role": "system", "content": system},
+                {"role": "user", "content": user},
+            ],
+            "stream": False,
+            "format": schema,
+            "options": {"temperature": 0.0},
+        },
+        timeout=timeout,
+    )
+    if response.status_code != 200:
+        raise OllamaError(f"Ollama returned {response.status_code}: {response.text}")
+
+    content = response.json()["message"]["content"]
+    try:
+        return json.loads(content)
+    except json.JSONDecodeError as exc:
+        # Should be unreachable given constrained decoding, but a truncated
+        # response (hitting the context limit mid-document) can still get
+        # here, and silently returning nothing would look like "no tasks
+        # found" rather than "the model was cut off".
+        raise OllamaError(f"model returned unparseable JSON: {content[:200]}") from exc
+
+
 def chat_stream(
     system: str,
     user: str,
