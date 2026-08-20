@@ -1,0 +1,30 @@
+# --- Python ---
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+
+# --- Virtual environments ---
+.venv/
+venv/
+# Leading slash anchors this to the repo root. Without it, macOS's
+# case-insensitive matching makes this pattern swallow app/llm/ too.
+/LLM/
+
+# --- Runtime data (regenerable, and can contain meeting content) ---
+# The database holds real transcripts. Never commit it: it is both large
+# and potentially confidential. Anyone cloning the repo regenerates it by
+# running the ingest/transcribe scripts.
+data/
+
+# --- Media (large binaries do not belong in git) ---
+sample_data/audio/
+*.m4a
+*.mp3
+*.wav
+
+# --- Secrets ---
+.env
+
+# --- macOS ---
+.DS_Store

@@ -1,0 +1,31 @@
+# --- ASR (speech -> text) ---
+# faster-whisper is a reimplementation of OpenAI's Whisper on CTranslate2.
+# Same model weights, several times faster on CPU, and it releases the GIL
+# during inference -- which is what lets us push it onto a worker thread
+# without freezing the async server. See app/asr.py.
+faster-whisper>=1.2
+
+# --- API + streaming ---
+fastapi>=0.115
+uvicorn[standard]>=0.30
+websockets>=13
+
+# --- Audio handling (used by the client simulator) ---
+# Needs ffmpeg on the system for non-wav formats: brew install ffmpeg
+pydub>=0.25
+audioop-lts; python_version >= "3.13"
+
+# --- RAG ---
+# sentence-transformers turns text into vectors; faiss does the nearest
+# neighbour search over those vectors.
+sentence-transformers>=3.0
+faiss-cpu>=1.8
+
+# --- Document loading ---
+pypdf>=5.0
+
+# --- LLM client (talks to the local Ollama HTTP API) ---
+httpx>=0.27
+
+# --- Tests ---
+pytest>=8.0

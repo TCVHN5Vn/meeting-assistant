@@ -1,0 +1,261 @@
+# Design notes
+
+Why this system is built the way it is, and what the alternatives cost.
+Each section is a decision that could reasonably have gone the other way.
+
+---
+
+## 1. Why a server and a client, rather than one script
+
+Stage 1 was a single script: audio file in, transcript out, process exits.
+That is the correct shape for a batch job and the wrong shape for a meeting
+assistant, for two reasons.
+
+**Model loading.** Whisper takes seconds to load into memory. In a script
+that cost is paid once and amortised over the whole file. In a
+request-per-process design it would be paid on every single request, and
+would dominate the runtime of a 5-second audio chunk.
+
+**Latency.** A meeting assistant that produces its transcript after the
+meeting has ended is a transcription tool, not an assistant. Answering
+questions *during* the meeting requires text to exist *during* the meeting,
+which requires processing audio as it arrives.
+
+So the server is a long-lived process that loads the model once at startup
+and stays up. WebSocket rather than HTTP because the transport needs to be
+bidirectional and continuous: audio flows continuously in one direction while
+transcript chunks flow back in the other, on the same connection, without
+the client polling.
+
+`client_simulator.py` exists because testing this needs an audio source, and
+wiring up a live microphone is a different problem from the one being
+solved. It chops a finished recording into 5-second slices and sends them
+with a real 5-second sleep between each. The server cannot tell the
+difference. Swapping it for real microphone capture changes one file and
+touches no server code.
+
+---
+
+## 2. Why `asyncio.to_thread` around Whisper
+
+The first version of the server called `model.transcribe()` directly inside
+the `async def` WebSocket handler. That looks fine and is a real bug.
+
+An `async def` function only yields control to the event loop at an `await`.
+A blocking CPU call inside one occupies the event loop thread for its whole
+duration — so while one client's 5-second chunk is being transcribed, every
+other connection is frozen, and even `/health` does not respond. The code
+was *shaped* like concurrent code without *being* concurrent.
+
+`asyncio.to_thread` moves the work to a worker thread and awaits the result,
+freeing the loop.
+
+**The part that matters:** a thread only helps because faster-whisper's
+backend (CTranslate2) is C++ and releases the GIL while computing. For
+CPU-bound work written in pure Python, the GIL would keep everything
+serialised and a thread would buy nothing — that case needs a process pool.
+Knowing which of the two you have is the actual skill; "use to_thread for
+blocking calls" without that distinction is cargo cult.
+
+There is a related trap in `app/asr.py`: `transcribe_bytes` returns a
+`list`, not a generator. faster-whisper's segment generator is lazy, so
+transcription only really happens as you iterate it. Return the generator
+and the computation moves back onto the event loop when the caller iterates
+it — reintroducing exactly the bug the thread was meant to fix.
+
+---
+
+## 3. Why the vectors are not in the database
+
+SQLite cannot do nearest-neighbour search. A B-tree index sorts values along
+a line; it has no concept of "close" in 384 dimensions. Finding nearest
+neighbours means comparing a query vector against every stored vector —
+arithmetic over a matrix of floats, which is what FAISS is for.
+
+So there are two stores, joined by one column:
+
+```
+SQLite  document_chunks.text        FAISS  position 0, 1, 2, ...
+        document_chunks.vector_id ──────▶
+```
+
+FAISS returns integer positions and distances. It stores no text. Turning
+"vector #7" back into readable text is a lookup on `vector_id`.
+
+**The cost of this design is consistency.** The two stores can drift, and
+when they do, nothing errors — search returns text that does not correspond
+to the vector that matched, confidently and silently. This project handles
+it by never mutating the index in place: any change to the corpus rebuilds
+the whole index and reassigns every `vector_id` in one deterministic ordered
+pass (`_rebuild_index` in `app/rag/ingest.py`). Slow in principle, a few
+seconds in practice, and it makes the failure mode impossible rather than
+unlikely. `/api/v1/index/stats` reports whether the two counts still agree.
+
+**Postgres with pgvector** — what the original architecture document
+specified — collapses both stores into one, so the chunk row and its vector
+are written in the same transaction and cannot drift. That is the strongest
+argument for it. The cost is running a database server. At the point where
+rebuilding the index stops being cheap, that becomes the right trade.
+
+---
+
+## 4. Why `IndexFlatIP` and normalised vectors
+
+`IndexFlatIP` computes inner products. `IndexFlatL2` computes Euclidean
+distance. For vectors normalised to length 1, the inner product **is** the
+cosine of the angle between them — so normalising at embedding time and
+using IP gives cosine similarity, bounded in [-1, 1].
+
+Cosine is the right measure for text because it compares *direction* (what
+the text is about) and ignores *magnitude* (roughly, length and emphasis).
+Two passages on the same topic at different lengths should score as similar;
+Euclidean distance would penalise the length difference.
+
+"Flat" means exhaustive: every query is compared against every vector, so
+results are exactly correct. That is O(n), which is fine for thousands or
+hundreds of thousands of chunks. Only at millions does an approximate index
+(IVF, HNSW) become worth its recall loss. Reaching for the approximate index
+first is premature optimisation, and an interviewer asking "why not HNSW?"
+is usually checking whether you know that.
+
+---
+
+## 5. Chunking: 1000 characters, 200 overlap
+
+**Why chunk at all** — an embedding is one fixed-size vector regardless of
+input length. Embedding a whole handbook averages every topic in it into one
+blurry point that is vaguely near everything and strongly near nothing.
+Chunking gives each idea its own vector. Secondarily, retrieved text has to
+fit in the model's context window alongside the question.
+
+**Why overlap** — boundaries are arbitrary and land mid-thought. If a
+condition ends up at the tail of chunk 4 and its consequence at the head of
+chunk 5, neither answers the question alone. Repeating ~200 characters means
+any short passage survives intact somewhere. The cost is storage and
+near-duplicate results.
+
+**The tradeoff** — smaller chunks give sharper retrieval and lose context;
+larger chunks carry more context per hit but blur the vector and crowd the
+context window.
+
+**The honest answer to "how did you pick 1000/200?"** is that it is a
+common default, and that picking it properly means building an evaluation
+set of real questions with known-correct source passages and measuring
+retrieval quality (recall@k) across settings. Claiming a tuned number
+without that measurement is the wrong answer.
+
+Chunking is character-based rather than token-based. Tokens are more
+accurate — models think in tokens and the characters-per-token ratio varies
+by language — but characters need no tokenizer and are close enough here.
+English averages roughly 4 characters per token.
+
+---
+
+## 6. Refusing before generating, not after
+
+`answer_question` returns a fixed refusal *without calling the LLM* when
+nothing clears the relevance floor.
+
+This matters because vector search always returns its top-k, no matter how
+poor the matches are. Ask an HR corpus about lasagna and it still hands back
+chunks — just with low scores. Pass those to a model and it will produce a
+fluent answer built from irrelevant context or, worse, from its training
+data. The system prompt says "answer only from the context", but a prompt is
+a request, not a guarantee.
+
+A score threshold enforced in code is a guarantee. It also saves the
+generation call entirely, which on a local 7B model is the expensive part.
+
+Calibrating the threshold is model-specific. With MiniLM on this corpus,
+>0.5 is a solid match, 0.3–0.5 is loosely related, below 0.3 is noise; 0.25
+is the floor here. Copying a threshold from another project's blog post
+without checking it against your own data is how this quietly stops working.
+
+---
+
+## 7. Two endpoints, `/search` and `/ask`
+
+`/search` returns what retrieval found. `/ask` returns what the LLM
+generated from it. They could have been one endpoint with a flag.
+
+Keeping them separate means that when an answer is wrong, one request tells
+you which half is at fault. Bad retrieval and bad generation look identical
+from the outside and have completely different fixes — chunk size, embedding
+model, and threshold for one; prompt, temperature, and model size for the
+other. Without this split you are guessing. The `--no-llm` flag on
+`scripts/ask.py` exists for the same reason.
+
+---
+
+## 8. Local models instead of a hosted API
+
+**For:** zero marginal cost, works offline, and — the real argument for a
+meeting recorder — audio and company documents never leave the machine.
+That is a compliance story, not just a cost saving, and it is often the
+deciding factor for legal or regulated customers.
+
+**Against:** a 7B model on a laptop is meaningfully weaker than a frontier
+hosted model, and slower to first token. Quality on multi-step reasoning and
+on strict structured output is visibly lower.
+
+The decision is made reversible by keeping every model call behind
+`app/llm/ollama_client.py`. Swapping to a hosted API means writing one more
+module exposing the same three functions; no pipeline code changes. That is
+the point of the module boundary — not tidiness, but keeping a decision
+cheap to revisit.
+
+Streaming (`chat_stream`) does not make generation faster. It makes it *feel*
+fast, because text appears in under a second instead of after twenty. For
+someone waiting mid-meeting, that is the difference between a tool that gets
+used and one that does not.
+
+---
+
+## 9. Confidence scores are stored raw, not thresholded
+
+faster-whisper gives no clean 0–1 confidence. `avg_logprob` is the closest
+proxy: an average log-probability, so 0 is perfectly confident and more
+negative is less confident.
+
+It is stored as-is rather than filtered at write time, because the threshold
+depends on what the data is being used for. A transcript shown to a human
+should include a low-confidence chunk — the reader can judge it. The same
+chunk being embedded into the retrieval index probably should not, because
+garbage text produces a garbage vector that will then match queries it has
+nothing to do with, and quietly poison results. Same number, two different
+thresholds. Deciding at read time keeps both options open; filtering at
+write time throws information away permanently.
+
+---
+
+## Known limitations
+
+Worth being able to name unprompted — being asked "what would you fix
+first?" and having a real answer is worth more than an unbroken defence.
+
+1. **Chunk boundaries cut words.** The client slices audio every 5 seconds
+   regardless of whether anyone is mid-sentence, and each slice is
+   transcribed independently with no context from the previous one. Whisper
+   loses the word at the seam. The fix is voice-activity detection to cut at
+   natural pauses, plus a rolling audio buffer with overlap — the same
+   overlap idea used for text chunks, applied to audio.
+
+2. **No speaker diarization.** `speaker_id` exists in the schema and is
+   always NULL. Adding pyannote would populate it, at real CPU cost.
+
+3. **A `sqlite3` connection is opened per WebSocket connection** and every
+   insert commits individually. Fine for one client; at scale this needs
+   batched commits and WAL mode, and SQLite's single-writer model becomes
+   the ceiling that forces the Postgres migration.
+
+4. **Retrieval is over documents only, not transcripts.** The transcript
+   chunks sit in the same database, unembedded. Indexing them would enable
+   "what did we decide about the search rewrite last month?" — arguably the
+   more valuable feature, and a small extension of the existing pipeline.
+
+5. **No evaluation set.** Retrieval quality is assessed by trying queries
+   and looking at the output. That is fine for development and not fine as
+   a claim of quality. A labelled question→passage set with recall@k is what
+   would turn tuning from guesswork into measurement.
+
+6. **No authentication.** Sprint 5. Every endpoint is currently open.
