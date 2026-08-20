@@ -228,6 +228,37 @@ write time throws information away permanently.
 
 ---
 
+## 10. Chunk-relative timestamps had to be offset
+
+Found by reading the output of a real streaming run rather than by reading
+the code, which is the only way this kind of bug gets found.
+
+Every chunk is handed to Whisper in isolation, so Whisper timestamps it from
+zero. The fortieth second of the meeting came back labelled `start_ts: 0.0`,
+the same as the first. Nothing errored. The transcript still looked correct
+in the terminal, because the chunks happened to arrive in order.
+
+What it broke was everything built on top: `ORDER BY start_ts` returned
+essentially random order, "jump to this moment in the recording" was
+impossible, and action items extracted later would have carried meaningless
+timestamps. The batch path was unaffected — one file, one call, real
+timestamps — so the two code paths silently disagreed about what `start_ts`
+meant.
+
+The fix is a running offset per connection, advanced by each chunk's audio
+duration. The subtlety is advancing by the AUDIO duration rather than by the
+end of the last segment: a chunk that ends in silence produces no segment
+for that silence, so using the last segment's end would quietly lose those
+seconds and the offset would drift further behind as the meeting went on. A
+drifting clock is much harder to notice than a stopped one.
+
+The general lesson: when the same data is produced by two code paths, the
+invariant they are supposed to share — here, "timestamps are relative to the
+start of the meeting" — needs to be stated somewhere and checked. Otherwise
+one path can violate it for a week without anything failing.
+
+---
+
 ## Known limitations
 
 Worth being able to name unprompted — being asked "what would you fix

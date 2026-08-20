@@ -56,6 +56,10 @@ async def ws_meeting(websocket: WebSocket, meeting_id: str):
     db.create_meeting(conn, meeting_id, title="Live Meeting")
     print(f"[{meeting_id}] client connected")
 
+    # Seconds of audio received so far on this connection. See the comment
+    # in the loop below for why this has to exist.
+    offset = 0.0
+
     try:
         while True:
             # Suspends this coroutine until the next chunk arrives, WITHOUT
@@ -81,27 +85,47 @@ async def ws_meeting(websocket: WebSocket, meeting_id: str):
             # Python CPU work the GIL would keep it serialised and you would
             # need a process pool instead. Knowing which of the two applies
             # is the actual skill here.
-            segments = await asyncio.to_thread(asr.transcribe_bytes, audio_bytes)
+            segments, chunk_duration = await asyncio.to_thread(
+                asr.transcribe_bytes, audio_bytes
+            )
 
             for segment in segments:
+                # Whisper timestamps each chunk in isolation, so they all
+                # start again from 0.0. Left uncorrected, every segment in
+                # a 40-minute meeting claims to happen in its first few
+                # seconds -- which silently destroys ordering, makes
+                # "jump to this moment in the audio" impossible, and would
+                # put nonsense timestamps on extracted action items later.
+                # Adding the running offset converts chunk-relative time
+                # into meeting-relative time.
+                start_ts = offset + segment.start
+                end_ts = offset + segment.end
+
                 db.insert_transcript_chunk(
                     conn,
                     chunk_id=str(uuid.uuid4()),
                     meeting_id=meeting_id,
                     text=segment.text,
-                    start_ts=segment.start,
-                    end_ts=segment.end,
+                    start_ts=start_ts,
+                    end_ts=end_ts,
                     confidence=segment.confidence,
                 )
                 await websocket.send_json({
                     "event": "transcript_chunk",
                     "data": {
                         "text": segment.text,
-                        "start_ts": segment.start,
-                        "end_ts": segment.end,
+                        "start_ts": start_ts,
+                        "end_ts": end_ts,
                         "confidence": segment.confidence,
                     },
                 })
+
+            # Advance by the AUDIO duration, not by the end of the last
+            # segment. A chunk ending in silence produces no segment for
+            # that silence, so using the last segment's end would lose
+            # those seconds and the offset would drift earlier and earlier
+            # as the meeting went on.
+            offset += chunk_duration
 
     except WebSocketDisconnect:
         print(f"[{meeting_id}] client disconnected")
