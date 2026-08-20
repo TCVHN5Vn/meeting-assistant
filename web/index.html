@@ -1,0 +1,706 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Meeting Assistant</title>
+<style>
+  :root {
+    --ground:#F5F7F8; --surface:#FFFFFF; --sunken:#EDF1F3;
+    --ink:#141A1F; --ink-2:#3A464F; --muted:#5F6C76;
+    --line:#DCE3E7; --line-2:#C3CED4;
+    --doc:#0C6A67; --doc-bg:#E2F0EF;
+    --speech:#A25F09; --speech-bg:#F7ECDC;
+    --live:#B0332A; --ok:#0C6A67;
+    --mono:ui-monospace,"SF Mono",Menlo,Consolas,monospace;
+    --sans:system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --ground:#0E1317; --surface:#151C22; --sunken:#1B242B;
+      --ink:#E3E9ED; --ink-2:#BCC6CE; --muted:#8B97A1;
+      --line:#243038; --line-2:#33424C;
+      --doc:#4FC2BB; --doc-bg:#12312F;
+      --speech:#E0A245; --speech-bg:#33260F;
+      --live:#E58273; --ok:#4FC2BB;
+    }
+  }
+  * { box-sizing:border-box; }
+  body {
+    margin:0; background:var(--ground); color:var(--ink);
+    font-family:var(--sans); font-size:14px; line-height:1.5;
+    height:100vh; display:flex; flex-direction:column;
+    -webkit-font-smoothing:antialiased;
+  }
+  button {
+    font:inherit; font-weight:500; cursor:pointer;
+    background:var(--surface); color:var(--ink);
+    border:1px solid var(--line-2); border-radius:4px; padding:7px 13px;
+  }
+  button:hover:not(:disabled) { border-color:var(--ink-2); }
+  button:disabled { opacity:.45; cursor:not-allowed; }
+  button.primary { background:var(--doc); border-color:var(--doc); color:#fff; }
+  button.danger  { background:var(--live); border-color:var(--live); color:#fff; }
+  input, select, textarea {
+    font:inherit; background:var(--surface); color:var(--ink);
+    border:1px solid var(--line-2); border-radius:4px; padding:8px 10px;
+    width:100%;
+  }
+  :focus-visible { outline:2px solid var(--doc); outline-offset:2px; }
+
+  /* ---------- login ---------- */
+  #login { margin:auto; width:min(360px,92vw); }
+  #login h1 { font-size:1.35rem; margin:0 0 4px; letter-spacing:-.01em; }
+  #login p.sub { color:var(--muted); margin:0 0 22px; font-size:.9rem; }
+  #login label { display:block; font-size:.78rem; color:var(--muted);
+                 margin:0 0 5px; text-transform:uppercase; letter-spacing:.07em; }
+  #login .field { margin-bottom:14px; }
+  #login button { width:100%; padding:10px; }
+  .error { color:var(--live); font-size:.85rem; margin-top:12px; min-height:1.2em; }
+
+  /* ---------- shell ---------- */
+  header {
+    display:flex; align-items:center; gap:14px; flex-wrap:wrap;
+    padding:11px 18px; border-bottom:1px solid var(--line); background:var(--surface);
+  }
+  header h1 { font-size:.95rem; margin:0; font-weight:600; letter-spacing:-.01em; }
+  header .spacer { flex:1; }
+  header .who { font-size:.82rem; color:var(--muted); }
+  .rec-dot {
+    width:9px; height:9px; border-radius:50%; background:var(--live);
+    display:inline-block; margin-right:6px;
+  }
+  @media (prefers-reduced-motion: no-preference) {
+    .recording .rec-dot { animation:pulse 1.4s ease-in-out infinite; }
+  }
+  @keyframes pulse { 50% { opacity:.25; } }
+
+  main { flex:1; display:grid; grid-template-columns:1fr 400px; min-height:0; }
+  @media (max-width:900px) { main { grid-template-columns:1fr; } }
+
+  .pane { display:flex; flex-direction:column; min-height:0; min-width:0; }
+  .pane + .pane { border-left:1px solid var(--line); }
+  .pane-head {
+    display:flex; align-items:center; gap:8px; padding:9px 16px;
+    border-bottom:1px solid var(--line); background:var(--surface);
+    font-size:.75rem; text-transform:uppercase; letter-spacing:.09em; color:var(--muted);
+  }
+  .pane-body { flex:1; overflow-y:auto; padding:14px 16px; }
+
+  /* ---------- transcript ---------- */
+  .line { display:flex; gap:11px; margin-bottom:9px; align-items:baseline; }
+  .line .t {
+    font-family:var(--mono); font-size:.72rem; color:var(--muted);
+    flex:0 0 auto; font-variant-numeric:tabular-nums;
+  }
+  .line.low .x { color:var(--muted); }
+  .line.low .t::after { content:" ?"; color:var(--speech); }
+  .empty { color:var(--muted); font-size:.88rem; font-style:italic; }
+
+  /* ---------- tabs ---------- */
+  .tabs { display:flex; gap:2px; }
+  .tab {
+    border:0; border-bottom:2px solid transparent; background:none; border-radius:0;
+    padding:6px 10px; font-size:.75rem; text-transform:uppercase;
+    letter-spacing:.09em; color:var(--muted);
+  }
+  .tab[aria-selected="true"] { color:var(--ink); border-bottom-color:var(--doc); }
+  .hidden { display:none !important; }
+
+  /* ---------- ask ---------- */
+  .ask-form { display:flex; gap:8px; padding:12px 16px; border-bottom:1px solid var(--line); }
+  .qa { border:1px solid var(--line); border-radius:5px; background:var(--surface);
+        padding:13px 15px; margin-bottom:14px; }
+  .qa .q { font-weight:600; margin-bottom:9px; }
+  .qa .a { white-space:pre-wrap; }
+  .qa .trigger {
+    font-family:var(--mono); font-size:.68rem; text-transform:uppercase;
+    letter-spacing:.07em; color:var(--muted); margin-bottom:6px;
+  }
+  .sources { margin-top:11px; padding-top:10px; border-top:1px solid var(--line);
+             display:flex; flex-direction:column; gap:5px; }
+  .src { font-size:.78rem; display:flex; gap:7px; align-items:baseline; }
+  .src .n { font-family:var(--mono); color:var(--muted); }
+  .badge {
+    font-family:var(--mono); font-size:.66rem; padding:1px 5px; border-radius:3px;
+    text-transform:uppercase; letter-spacing:.05em; white-space:nowrap;
+  }
+  .badge.document   { background:var(--doc-bg);    color:var(--doc);    border:1px solid var(--doc); }
+  .badge.transcript { background:var(--speech-bg); color:var(--speech); border:1px solid var(--speech); }
+  .score { font-family:var(--mono); color:var(--muted); font-variant-numeric:tabular-nums; }
+  .cursor { display:inline-block; width:7px; height:1em; background:var(--doc);
+            vertical-align:text-bottom; }
+  @media (prefers-reduced-motion: no-preference) {
+    .cursor { animation:blink 1s step-end infinite; }
+  }
+  @keyframes blink { 50% { opacity:0; } }
+
+  /* ---------- tasks ---------- */
+  .task { border:1px solid var(--line); border-radius:5px; background:var(--surface);
+          padding:11px 13px; margin-bottom:10px; }
+  .task.done .desc { text-decoration:line-through; color:var(--muted); }
+  .task .desc { font-weight:500; margin-bottom:6px; }
+  .task .meta { display:flex; gap:9px; flex-wrap:wrap; align-items:center;
+                font-size:.76rem; color:var(--muted); margin-bottom:8px; }
+  .task .quote {
+    font-size:.78rem; color:var(--ink-2); border-left:2px solid var(--line-2);
+    padding-left:9px; margin-bottom:9px; font-style:italic;
+  }
+  .task button { padding:4px 9px; font-size:.76rem; }
+  .pill { font-family:var(--mono); font-size:.68rem; padding:1px 6px;
+          border-radius:3px; border:1px solid var(--line-2); }
+  .toolbar { display:flex; gap:8px; padding:12px 16px; border-bottom:1px solid var(--line);
+             align-items:center; }
+  .status { font-size:.8rem; color:var(--muted); }
+</style>
+</head>
+<body>
+
+<!-- ============ LOGIN ============ -->
+<div id="login">
+  <h1>Meeting Assistant</h1>
+  <p class="sub">Everything runs on this machine.</p>
+  <form id="login-form">
+    <div class="field">
+      <label for="email">Email</label>
+      <input id="email" type="email" autocomplete="username" required>
+    </div>
+    <div class="field">
+      <label for="password">Password</label>
+      <input id="password" type="password" autocomplete="current-password" required>
+    </div>
+    <button class="primary" type="submit">Sign in</button>
+    <p class="error" id="login-error" role="alert"></p>
+  </form>
+</div>
+
+<!-- ============ APP ============ -->
+<header class="hidden" id="app-header">
+  <h1>Meeting Assistant</h1>
+  <button id="record" class="primary">Start recording</button>
+  <span class="status" id="conn-status"></span>
+  <span class="spacer"></span>
+  <span class="who" id="who"></span>
+  <button id="signout">Sign out</button>
+</header>
+
+<main class="hidden" id="app">
+  <section class="pane">
+    <div class="pane-head">
+      <span>Transcript</span>
+      <span class="spacer" style="flex:1"></span>
+      <span class="status" id="meeting-label"></span>
+    </div>
+    <div class="pane-body" id="transcript">
+      <p class="empty">Press <strong>Start recording</strong> and speak. Say
+        &ldquo;Hey assistant&rdquo; followed by a question to have it answer out loud.</p>
+    </div>
+  </section>
+
+  <section class="pane">
+    <div class="pane-head">
+      <div class="tabs" role="tablist">
+        <button class="tab" id="tab-ask"   role="tab" aria-selected="true"  aria-controls="panel-ask">Ask</button>
+        <button class="tab" id="tab-tasks" role="tab" aria-selected="false" aria-controls="panel-tasks">Action items</button>
+      </div>
+    </div>
+
+    <div id="panel-ask" role="tabpanel" aria-labelledby="tab-ask"
+         style="flex:1; display:flex; flex-direction:column; min-height:0;">
+      <form class="ask-form" id="ask-form">
+        <input id="question" placeholder="Ask about documents or past meetings…" autocomplete="off">
+        <button class="primary" type="submit">Ask</button>
+      </form>
+      <div class="pane-body" id="answers">
+        <p class="empty">Answers cite what they were built from. Nothing found above the
+          relevance floor means it says so rather than guessing.</p>
+      </div>
+    </div>
+
+    <div id="panel-tasks" role="tabpanel" aria-labelledby="tab-tasks"
+         class="hidden" style="flex:1; display:flex; flex-direction:column; min-height:0;">
+      <div class="toolbar">
+        <button id="extract">Extract action items</button>
+        <span class="status" id="task-status"></span>
+      </div>
+      <div class="pane-body" id="tasks">
+        <p class="empty">Extraction runs over the transcript after a meeting. Every item
+          carries the sentence it came from.</p>
+      </div>
+    </div>
+  </section>
+</main>
+
+<script type="module">
+// ===================================================================
+// State
+// ===================================================================
+// sessionStorage rather than localStorage: the token dies with the tab
+// instead of persisting on disk indefinitely. Neither is safe against XSS
+// -- any script on the page can read both. The genuinely safer answer is an
+// httpOnly cookie, which the browser will not hand to JavaScript at all, and
+// which costs a CSRF defence in exchange. Noted as the tradeoff it is.
+const store = window.sessionStorage;
+let token = store.getItem("token");
+let meetingId = null;
+let ws = null;
+let audio = null;           // { ctx, stream, node }
+let currentAnswer = null;   // the <div> being streamed into
+
+const $ = (id) => document.getElementById(id);
+const SAMPLE_RATE = 16000;
+const FRAME_SAMPLES = SAMPLE_RATE;   // send ~1s per frame
+
+// ===================================================================
+// API
+// ===================================================================
+async function api(path, options = {}) {
+  const response = await fetch(path, {
+    ...options,
+    headers: {
+      "content-type": "application/json",
+      ...(token ? { authorization: `Bearer ${token}` } : {}),
+      ...(options.headers || {}),
+    },
+  });
+  if (response.status === 401) { signOut(); throw new Error("session expired"); }
+  if (!response.ok) {
+    const body = await response.json().catch(() => ({}));
+    throw new Error(body.detail || `request failed (${response.status})`);
+  }
+  return response.json();
+}
+
+// ===================================================================
+// Auth
+// ===================================================================
+$("login-form").addEventListener("submit", async (event) => {
+  event.preventDefault();
+  $("login-error").textContent = "";
+  try {
+    const result = await api("/api/v1/auth/login", {
+      method: "POST",
+      body: JSON.stringify({ email: $("email").value, password: $("password").value }),
+    });
+    token = result.access_token;
+    store.setItem("token", token);
+    store.setItem("email", result.user.email);
+    showApp(result.user.email);
+  } catch (error) {
+    $("login-error").textContent = error.message;
+  }
+});
+
+function signOut() {
+  stopRecording();
+  store.clear();
+  token = null;
+  $("login").classList.remove("hidden");
+  $("app").classList.add("hidden");
+  $("app-header").classList.add("hidden");
+}
+$("signout").addEventListener("click", signOut);
+
+function showApp(email) {
+  $("who").textContent = email;
+  $("login").classList.add("hidden");
+  $("app").classList.remove("hidden");
+  $("app-header").classList.remove("hidden");
+}
+
+// Resume an existing session, but verify the token is still valid rather
+// than trusting that a value in storage means anything.
+if (token) {
+  api("/api/v1/auth/me")
+    .then((user) => showApp(user.email))
+    .catch(() => signOut());
+}
+
+// ===================================================================
+// Audio capture
+// ===================================================================
+// The worklet lives in a Blob URL so the whole app stays one file. It runs
+// on the audio rendering thread, which must never block -- so it does the
+// minimum: buffer to one second, convert to 16-bit, hand it over.
+const WORKLET = `
+class PCMFrames extends AudioWorkletProcessor {
+  constructor() { super(); this.buf = new Float32Array(${FRAME_SAMPLES}); this.n = 0; }
+  process(inputs) {
+    const input = inputs[0];
+    if (!input || !input[0]) return true;
+    const channel = input[0];
+    for (let i = 0; i < channel.length; i++) {
+      this.buf[this.n++] = channel[i];
+      if (this.n === this.buf.length) {
+        // Float [-1,1] -> signed 16-bit, clamped. Scaling by 32768 keeps
+        // the negative extreme exact; clamping stops a sample slightly
+        // over 1.0 wrapping around into a loud click.
+        const pcm = new Int16Array(this.buf.length);
+        for (let j = 0; j < this.buf.length; j++) {
+          const s = Math.max(-1, Math.min(1, this.buf[j]));
+          pcm[j] = s < 0 ? s * 32768 : s * 32767;
+        }
+        this.port.postMessage(pcm.buffer, [pcm.buffer]);
+        this.n = 0;
+      }
+    }
+    return true;
+  }
+}
+registerProcessor("pcm-frames", PCMFrames);
+`;
+
+async function startAudio(onFrame) {
+  const stream = await navigator.mediaDevices.getUserMedia({
+    audio: {
+      channelCount: 1,
+      // The browser's own cleanup, before anything of ours sees the signal.
+      echoCancellation: true,
+      noiseSuppression: true,
+      autoGainControl: true,
+    },
+  });
+
+  // Asking the AudioContext for 16 kHz makes the browser resample properly,
+  // with the anti-alias filtering that naive downsampling in JavaScript
+  // would skip -- and skipping it folds high frequencies down into the
+  // speech band as noise.
+  const ctx = new AudioContext({ sampleRate: SAMPLE_RATE });
+  if (ctx.sampleRate !== SAMPLE_RATE) {
+    stream.getTracks().forEach((t) => t.stop());
+    await ctx.close();
+    throw new Error(`browser gave ${ctx.sampleRate} Hz, not ${SAMPLE_RATE} Hz`);
+  }
+
+  const url = URL.createObjectURL(new Blob([WORKLET], { type: "application/javascript" }));
+  await ctx.audioWorklet.addModule(url);
+  URL.revokeObjectURL(url);
+
+  const node = new AudioWorkletNode(ctx, "pcm-frames");
+  node.port.onmessage = (event) => onFrame(event.data);
+  ctx.createMediaStreamSource(stream).connect(node);
+
+  // A worklet is only pulled if it reaches the destination. Routing through
+  // a silent gain keeps it running without playing the microphone back into
+  // the room.
+  const silent = ctx.createGain();
+  silent.gain.value = 0;
+  node.connect(silent).connect(ctx.destination);
+
+  return { ctx, stream, node };
+}
+
+// ===================================================================
+// Recording session
+// ===================================================================
+$("record").addEventListener("click", () => (ws ? stopRecording() : startRecording()));
+
+async function startRecording() {
+  $("record").disabled = true;
+  $("conn-status").textContent = "connecting…";
+  meetingId = crypto.randomUUID();
+
+  try {
+    ws = new WebSocket(`ws://${location.host}/ws/meetings/${meetingId}`);
+    await new Promise((resolve, reject) => {
+      ws.onopen = resolve;
+      ws.onerror = () => reject(new Error("could not connect"));
+    });
+
+    // The token is the FIRST message, not a query parameter: a browser
+    // cannot set headers on a WebSocket, and "?token=" would write a live
+    // credential into access logs and browser history.
+    ws.send(JSON.stringify({ event: "auth", data: { token } }));
+    ws.onmessage = handleServerEvent;
+    ws.onclose = (event) => {
+      if (event.code === 1008) $("conn-status").textContent = `refused: ${event.reason}`;
+      stopRecording();
+    };
+
+    audio = await startAudio((buffer) => {
+      if (ws && ws.readyState === WebSocket.OPEN) ws.send(buffer);
+    });
+
+    document.body.classList.add("recording");
+    $("record").textContent = "Stop recording";
+    $("record").className = "danger";
+    $("conn-status").innerHTML = '<span class="rec-dot"></span>recording';
+    $("meeting-label").textContent = `meeting ${meetingId.slice(0, 8)}`;
+    $("transcript").innerHTML = "";
+  } catch (error) {
+    $("conn-status").textContent = error.message;
+    stopRecording();
+  } finally {
+    $("record").disabled = false;
+  }
+}
+
+function stopRecording() {
+  if (audio) {
+    audio.stream.getTracks().forEach((track) => track.stop());
+    audio.node.disconnect();
+    audio.ctx.close();
+    audio = null;
+  }
+  if (ws) {
+    // Tell the server no more audio is coming, so it transcribes whatever is
+    // still buffered. It cannot infer this: a speaker mid-sentence when the
+    // audio stops looks exactly like one who has not paused yet.
+    if (ws.readyState === WebSocket.OPEN) {
+      ws.send(JSON.stringify({ event: "end_audio" }));
+      setTimeout(() => ws && ws.close(), 4000);
+    }
+    ws.onclose = null;
+    ws = null;
+  }
+  document.body.classList.remove("recording");
+  $("record").textContent = "Start recording";
+  $("record").className = "primary";
+  if (!$("conn-status").textContent.startsWith("refused")) $("conn-status").textContent = "";
+}
+
+// ===================================================================
+// Server events
+// ===================================================================
+function handleServerEvent(message) {
+  const { event, data } = JSON.parse(message.data);
+  switch (event) {
+    case "authenticated":  $("conn-status").innerHTML = '<span class="rec-dot"></span>recording'; break;
+    case "transcript_chunk": addTranscriptLine(data); break;
+    case "qa_listening":   showListening(data.question); break;
+    case "qa_started":     startAnswer(data); break;
+    case "qa_delta":       appendAnswer(data.text); break;
+    case "qa_response":    finishAnswer(); break;
+    case "qa_busy":        setAnswerNote(data.message); break;
+    case "audio_ended":    $("conn-status").textContent = "audio ended"; break;
+    case "qa_error":
+    case "error":          setAnswerNote(data.message); break;
+  }
+}
+
+function timestamp(seconds) {
+  const total = Math.floor(seconds);
+  const m = Math.floor(total / 60), s = total % 60;
+  return `${m}:${String(s).padStart(2, "0")}`;
+}
+
+function addTranscriptLine({ text, start_ts, confidence }) {
+  const pane = $("transcript");
+  pane.querySelector(".empty")?.remove();
+
+  const line = document.createElement("div");
+  // avg_logprob: 0 is confident, more negative is less. Marking the shaky
+  // lines rather than hiding them -- a reader can judge a doubtful line,
+  // and silently dropping it would look like the words were never said.
+  line.className = confidence < -0.7 ? "line low" : "line";
+  const stamp = document.createElement("span");
+  stamp.className = "t";
+  stamp.textContent = timestamp(start_ts);
+  const body = document.createElement("span");
+  body.className = "x";
+  body.textContent = text;
+  line.append(stamp, body);
+  pane.append(line);
+
+  // Only follow the transcript if the reader has not scrolled up to look at
+  // something. Yanking the view away mid-read is the classic log-tail sin.
+  const atBottom = pane.scrollHeight - pane.scrollTop - pane.clientHeight < 80;
+  if (atBottom) pane.scrollTop = pane.scrollHeight;
+}
+
+// ===================================================================
+// Q&A
+// ===================================================================
+$("ask-form").addEventListener("submit", async (event) => {
+  event.preventDefault();
+  const question = $("question").value.trim();
+  if (!question) return;
+  $("question").value = "";
+
+  // While a meeting is live the question goes over the socket, so the answer
+  // can use what was just said. Otherwise it is an ordinary HTTP request.
+  if (ws && ws.readyState === WebSocket.OPEN) {
+    ws.send(JSON.stringify({ event: "ask_query", data: { text: question } }));
+    return;
+  }
+
+  startAnswer({ question, trigger: "typed", sources: [] });
+  try {
+    const result = await api("/api/v1/ask", {
+      method: "POST", body: JSON.stringify({ question }),
+    });
+    setSources(result.sources);
+    appendAnswer(result.answer);
+    finishAnswer();
+  } catch (error) {
+    appendAnswer(`\n${error.message}`);
+    finishAnswer();
+  }
+});
+
+function startAnswer({ question, trigger, sources, live_context_chars }) {
+  const pane = $("answers");
+  pane.querySelector(".empty")?.remove();
+
+  // A "listening" placeholder is shown the moment a wake phrase is heard,
+  // before the question is known to be finished. When the real answer
+  // starts, that placeholder is the same question -- so it is replaced, not
+  // left behind. Without this the panel accumulates a dead card for every
+  // question asked out loud.
+  pane.querySelector("[data-listening]")?.remove();
+
+  const block = document.createElement("div");
+  block.className = "qa";
+  const label = trigger === "wake_phrase" ? "asked out loud"
+              : trigger === "typed" ? "typed" : trigger;
+  block.innerHTML = `<div class="trigger">${label}${
+    live_context_chars ? ` &middot; using ${live_context_chars} chars of this meeting` : ""
+  }</div>`;
+
+  const q = document.createElement("div");
+  q.className = "q";
+  q.textContent = question;
+  const a = document.createElement("div");
+  a.className = "a";
+  const cursor = document.createElement("span");
+  cursor.className = "cursor";
+  a.append(cursor);
+
+  block.append(q, a);
+  pane.prepend(block);
+  currentAnswer = { block, body: a, cursor };
+  if (sources && sources.length) setSources(sources);
+}
+
+function setSources(sources) {
+  if (!currentAnswer || !sources.length) return;
+  currentAnswer.block.querySelector(".sources")?.remove();
+  const list = document.createElement("div");
+  list.className = "sources";
+  sources.forEach((source, i) => {
+    const row = document.createElement("div");
+    row.className = "src";
+    row.innerHTML = `<span class="n">[${i + 1}]</span>
+      <span class="badge ${source.source_type}">${source.source_type}</span>
+      <span style="flex:1">${escapeHtml(source.citation)}</span>
+      <span class="score">${source.score.toFixed(3)}</span>`;
+    list.append(row);
+  });
+  currentAnswer.block.append(list);
+}
+
+function appendAnswer(text) {
+  if (!currentAnswer) return;
+  currentAnswer.cursor.insertAdjacentText("beforebegin", text);
+}
+
+function finishAnswer() {
+  currentAnswer?.cursor.remove();
+  currentAnswer = null;
+}
+
+function showListening(question) {
+  startAnswer({ question, trigger: "wake_phrase", sources: [] });
+  currentAnswer.block.dataset.listening = "1";
+  appendAnswer("listening for the rest of the question…");
+  // Not the answer in progress any more -- the next qa_started replaces this
+  // card entirely, and leaving it as `currentAnswer` would stream the real
+  // answer into a block that is about to be removed.
+  currentAnswer = null;
+}
+
+function setAnswerNote(message) {
+  if (currentAnswer) { appendAnswer(`\n${message}`); finishAnswer(); }
+  else $("conn-status").textContent = message;
+}
+
+function escapeHtml(value) {
+  const div = document.createElement("div");
+  div.textContent = value;
+  return div.innerHTML;
+}
+
+// ===================================================================
+// Tabs
+// ===================================================================
+for (const [tab, panel, other, otherPanel] of [
+  ["tab-ask", "panel-ask", "tab-tasks", "panel-tasks"],
+  ["tab-tasks", "panel-tasks", "tab-ask", "panel-ask"],
+]) {
+  $(tab).addEventListener("click", () => {
+    $(tab).setAttribute("aria-selected", "true");
+    $(other).setAttribute("aria-selected", "false");
+    $(panel).classList.remove("hidden");
+    $(otherPanel).classList.add("hidden");
+    if (tab === "tab-tasks") loadTasks();
+  });
+}
+
+// ===================================================================
+// Action items
+// ===================================================================
+async function loadTasks() {
+  if (!meetingId) return;
+  try {
+    const result = await api(`/api/v1/meetings/${meetingId}/tasks`);
+    renderTasks(result.tasks);
+  } catch (error) {
+    $("task-status").textContent = error.message;
+  }
+}
+
+$("extract").addEventListener("click", async () => {
+  if (!meetingId) { $("task-status").textContent = "record a meeting first"; return; }
+  $("extract").disabled = true;
+  $("task-status").textContent = "extracting… one model call per window";
+  try {
+    const result = await api(`/api/v1/meetings/${meetingId}/tasks`, { method: "POST" });
+    renderTasks(result.tasks);
+    $("task-status").textContent =
+      `${result.stored} kept · ${result.rejected} rejected · ${result.duplicates} merged`;
+  } catch (error) {
+    $("task-status").textContent = error.message;
+  } finally {
+    $("extract").disabled = false;
+  }
+});
+
+function renderTasks(tasks) {
+  const pane = $("tasks");
+  pane.innerHTML = "";
+  if (!tasks.length) {
+    pane.innerHTML = `<p class="empty">No action items found. An empty list is a
+      real answer here &mdash; most of what sounds like a commitment in a meeting is not one.</p>`;
+    return;
+  }
+  for (const task of tasks) {
+    const el = document.createElement("div");
+    el.className = task.status === "done" ? "task done" : "task";
+
+    const meta = [];
+    if (task.assignee) meta.push(`<span class="pill">${escapeHtml(task.assignee)}</span>`);
+    if (task.due) meta.push(`<span class="pill">${escapeHtml(task.due)}</span>`);
+    if (task.start_ts != null) meta.push(`<span class="score">${timestamp(task.start_ts)}</span>`);
+
+    el.innerHTML = `
+      <div class="desc">${escapeHtml(task.description)}</div>
+      <div class="meta">${meta.join("")}</div>
+      <div class="quote">${escapeHtml(task.quote || "")}</div>`;
+
+    const button = document.createElement("button");
+    button.textContent = task.status === "done" ? "Reopen" : "Mark done";
+    button.addEventListener("click", async () => {
+      const next = task.status === "done" ? "open" : "done";
+      await api(`/api/v1/tasks/${task.id}`, {
+        method: "PATCH", body: JSON.stringify({ status: next }),
+      });
+      task.status = next;
+      loadTasks();
+    });
+    el.append(button);
+    pane.append(el);
+  }
+}
+</script>
+</body>
+</html>

@@ -9,6 +9,8 @@ leaves the device.
 Built as a study of how ASR, RAG, an LLM, and a database fit together in one
 system, rather than as a wrapper around a hosted API.
 
+![The web UI](docs/img/ui-light.png)
+
 ```
    microphone / audio file
              │
@@ -73,7 +75,7 @@ can seek to: `Special General Meeting @ 33:46-35:05`.
 | — | Voice-activity detection: cut audio at pauses, not on a clock | **Done** |
 | 4 | Action-item extraction into structured tasks | **Done** |
 | 5a | JWT authentication, meeting ownership | **Done** |
-| 5b | Frontend | Not started |
+| 5b | Web UI with live microphone capture | **Done** |
 
 ## Stack
 
@@ -86,6 +88,28 @@ can seek to: `Special General Meeting @ 33:46-35:05`.
 | Vector search | FAISS `IndexFlatIP` | Exact search, no approximation error at this corpus size |
 | LLM | Ollama + `qwen2.5:7b-instruct` | Local, free, private; strong at instruction-following and structured output |
 | Database | SQLite | Zero setup; the schema is written so a Postgres migration is mechanical |
+
+## The web UI
+
+```bash
+uvicorn app.server:app --reload
+# open http://localhost:8000
+```
+
+Sign in, press **Start recording**, and speak. The browser captures the
+microphone, resamples to 16 kHz in an `AudioWorklet`, and streams raw PCM
+over the same WebSocket the CLI client uses — **the server cannot tell the
+difference**, which was the point of splitting client from server back in
+Sprint 1.
+
+Say *"Hey assistant, …"* followed by a question and it answers out loud,
+with its sources, while transcription carries on. Typed questions go over
+the socket during a meeting (so the answer can use what was just said) and
+over HTTP otherwise.
+
+One HTML file, no build step. React would earn its place when shared state
+across many components became the hard part; here there are two panes and
+one WebSocket. See §21 of the design notes.
 
 ## Authentication
 
@@ -370,6 +394,7 @@ app/
   llm/
     ollama_client.py   HTTP client for the local model
     prompts.py         prompt construction, kept as reviewable code
+web/index.html         the whole UI: one file, no build step
 scripts/               command-line entry points
 sample_data/documents/ example corpus
 tests/                 unit tests

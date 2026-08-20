@@ -863,6 +863,88 @@ restriction the deployment actually needs.
 
 ---
 
+## 21. The UI, and why it is not React
+
+The architecture document said React. This is one HTML file of vanilla
+JavaScript, served by the API that backs it, with no build step.
+
+React earns its place when shared state across many components becomes the
+hard part. Here there are two panes and one WebSocket, and the state is a
+token, a meeting id, and a list of transcript lines. Against that, a
+bundler, a `node_modules` tree and a second toolchain are a real cost — in a
+project whose entire claim is that it runs locally with no ceremony, and
+which a reader should be able to clone and run with `pip install`. Adding
+React would have been resume-driven rather than reasoned.
+
+That is a defensible answer *because it names the condition under which it
+flips*. "React is overkill here" is an argument; "React is bloat" is a
+slogan.
+
+### The browser is now the microphone
+
+This is what makes the UI more than a viewer: it removes the last piece of
+scaffolding. Until now audio could only come from a file replayed by a
+script. `getUserMedia` plus an `AudioWorklet` makes it a real microphone,
+and the server cannot tell the difference — which was the point of the
+client/server split back in Sprint 1.
+
+Three details that are easy to get wrong:
+
+**Ask the AudioContext for 16 kHz** rather than downsampling in JavaScript.
+`new AudioContext({sampleRate: 16000})` makes the browser resample with the
+anti-alias filtering that naive decimation skips — and skipping it folds
+high frequencies down into the speech band as noise, which sounds like a
+worse microphone and is actually a worse pipeline.
+
+**The worklet runs on the audio thread**, which must never block or the
+audio glitches. So it does the minimum: buffer to one second, convert to
+16-bit, hand the buffer over as a transferable. All the interesting work
+stays on the server.
+
+**A worklet is only pulled if it reaches the destination.** Connecting it
+straight to `ctx.destination` would play the microphone back into the room;
+routing through a gain node set to zero keeps it running silently.
+
+### The screenshot found a bug the tests could not
+
+The panel accumulated a dead "listening for the rest of the question…" card
+for every question asked out loud: the placeholder shown on hearing a wake
+phrase was never replaced by the real answer, only followed by it.
+
+Nothing was broken. Every request succeeded, every answer was correct, and
+no test could have failed — there was no assertion to make. It was visible
+in one glance at a rendered page and invisible everywhere else. **A class of
+defect that only surfaces when you look at the thing.**
+
+### Testing a UI without a human
+
+Driven through the Chrome DevTools Protocol: launch headless Chrome with a
+debugging port, connect over a WebSocket, and use `Runtime.evaluate` to fill
+the login form, click Record, and read the resulting DOM. No test framework,
+about eighty lines.
+
+Real microphone audio came from `--use-file-for-fake-audio-capture`, which
+replaces the microphone with a WAV file. **The app runs completely
+unmodified** — it calls `getUserMedia` and gets a real `MediaStream`, and
+every layer below is the production path.
+
+Two false starts worth recording, because both looked like application bugs
+and neither was:
+
+- The first run produced silence — `peak: 0` on every frame. The audio file
+  was suffixed `%noloop`, so Chrome played it once at browser startup, long
+  before anything called `getUserMedia`.
+- The second produced silence too, and Chrome had already said why in a log
+  nobody had read: `Failed to read /tmp/fakemic.wav ... Try disabling the
+  sandbox`. The fix was a flag.
+
+The frames were the right size and arriving at the right rate the whole
+time. **Instrumenting the amplitude rather than the plumbing is what
+separated "my code is broken" from "my test rig is broken"** — and the
+difference between those two is worth ten minutes of measurement every time.
+
+---
+
 ## Known limitations
 
 Worth being able to name unprompted — being asked "what would you fix
@@ -926,9 +1008,9 @@ first?" and having a real answer is worth more than an unbroken defence.
    a claim of quality. A labelled question→passage set with recall@k is what
    would turn tuning from guesswork into measurement.
 
-12. **No frontend.** Sprint 5's other half. Everything is a terminal or a
-    curl, which is the main thing standing between this and being legible to
-    someone who is not reading code.
+12. **The UI has no meeting history.** It records and asks against the
+    current session; browsing past meetings, their transcripts and their
+    tasks still means the API or a script.
 
 13. **No token refresh or revocation.** A token is valid for 12 hours and
     cannot be invalidated before then — revoking access means rotating the

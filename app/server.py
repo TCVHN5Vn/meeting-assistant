@@ -16,11 +16,12 @@ import uuid
 from contextlib import asynccontextmanager
 
 from fastapi import Depends, FastAPI, HTTPException, WebSocket, WebSocketDisconnect
+from fastapi.responses import FileResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel
 
 from app import auth
-from app.config import WS_AUTH_TIMEOUT_SECONDS
+from app.config import PROJECT_ROOT, WS_AUTH_TIMEOUT_SECONDS
 
 import numpy as np
 
@@ -154,6 +155,24 @@ _DUMMY_HASH = auth.hash_password("not-a-real-password")
 def me(user=Depends(current_user)):
     return {"id": user["id"], "email": user["email"],
             "name": user["name"], "role": user["role"]}
+
+
+WEB_DIR = PROJECT_ROOT / "web"
+
+
+@app.get("/")
+def index():
+    """Serve the single-page UI.
+
+    One HTML file with no build step, served by the API that backs it. The
+    architecture document suggested React; a bundler, a node_modules tree and
+    a second toolchain would be a real cost against a project whose whole
+    claim is that it runs locally with no ceremony, and this UI is a handful
+    of views over one WebSocket. React earns its place when shared state
+    across many components starts being the hard part. It is not, yet, and
+    adding it now would be resume-driven rather than reasoned.
+    """
+    return FileResponse(WEB_DIR / "index.html")
 
 
 @app.get("/health")
