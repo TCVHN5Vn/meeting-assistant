@@ -370,6 +370,160 @@ Two things worth taking from it:
 
 ---
 
+## 14. Answering must not block transcription
+
+The one architectural requirement of live Q&A. Generation on a local 7B
+model takes ten to twenty seconds. `await`ing it inside the WebSocket
+receive loop would stop the loop consuming audio — so chunks would pile up
+in the socket buffer while the meeting carried on talking, and transcription
+would fall behind by however long the answer took and never catch up.
+**The meeting does not pause for the assistant.**
+
+So the answer is started with `asyncio.create_task` and not awaited. The
+next line of the receive loop is immediately ready for the next audio chunk.
+You can see it working in a real run — transcript lines arriving in the
+middle of the answer being written:
+
+```
+│ [   20.0s] and Juana Arrujo-Keypert and Administration Lee.
+[   23.0s] Thank you.
+The three main goals of this meeting are: ...
+```
+
+Three consequences follow, and each needed handling:
+
+**A send lock.** Two coroutines now write to one socket — the receive loop
+sending `transcript_chunk`, the answer task sending `qa_delta` — and
+interleaving two writes on a WebSocket can split a frame. An `asyncio.Lock`
+makes each send atomic against the other. It was not needed before, because
+there was only ever one writer.
+
+**A done-callback.** An exception inside a bare `create_task` is swallowed
+and resurfaces as "Task exception was never retrieved" at garbage
+collection, long after the fact and detached from the question that caused
+it. The callback logs it against the meeting immediately.
+
+**One answer at a time.** Two concurrent generations on one machine compete
+for the same CPU and both come back slower than either alone — and a second
+answer arriving while the first is still printing is not readable anyway.
+The client is told `qa_busy` rather than being silently queued, because
+"your question was dropped" is information and silence is not.
+
+### Bridging a blocking generator into asyncio
+
+`ollama_client.chat_stream` is an ordinary synchronous generator: each
+`next()` blocks until the model emits a fragment. Iterating it inside a
+coroutine would hold the event loop for the whole generation — the same
+mistake as calling Whisper inline, but much harder to see, because a `for`
+loop over a generator does not look like a blocking call.
+
+`aiter_blocking` runs the iteration on a worker thread that pushes items
+onto an `asyncio.Queue` via `loop.call_soon_threadsafe` — the supported way
+to touch loop-owned objects from another thread; calling `put_nowait`
+directly from the thread would be a data race.
+
+Its honest limitation: **a Python thread cannot be cancelled from outside.**
+If the client disconnects mid-generation the thread runs to completion and
+its output is discarded. Detaching is the best available; genuinely stopping
+it would mean giving the producer a flag to poll and having the HTTP client
+abort the request.
+
+---
+
+## 15. Detection is a precision problem, not a recall problem
+
+The sprint's one-line description is "detect questions in the transcript
+stream". Implemented literally, that produces something unusable.
+
+A meeting is full of questions. Real ones, from the transcript in this
+repository: *"How have those been remembered for the past year?"*, *"What is
+the special general meeting?"*. Every one is a genuine question and not one
+is addressed to an assistant. They are people talking to each other.
+
+The asymmetry decides the design. A missed question costs one person typing
+it out. A false positive costs everyone's attention, mid-meeting, plus some
+credibility. **An assistant that interrupts gets switched off in the first
+ten minutes.** So the default is explicit address — the assistant answers
+when spoken to — with an `AUTO_ANSWER_MODE = "questions"` setting for
+demonstrating the pipeline, honest about being noisy.
+
+Detection is string matching on purpose. It runs on every chunk, roughly
+every five seconds, so it has to be free. Asking an LLM "is this for you?"
+would cost a full generation per chunk on a machine already running Whisper,
+and would make the assistant slow at the thing it must be fast at. Cheap
+gate first, expensive model only once the gate passes.
+
+### The wake phrase is the least reliable part of the sentence
+
+The first version matched the literal string `"hey assistant"` and never
+fired once on real audio. Whisper transcribed it as **"he assistant"**.
+
+That is structural, not bad luck. A wake phrase is short, said quickly and
+flatly, and sits at a phrase boundary where the recogniser has no
+surrounding words to constrain its guess. *The part of the utterance you are
+keying on is the part most likely to come back wrong.*
+
+So the name is matched exactly — "assistant" is long and distinctive enough
+to survive — while the greeting in front of it is matched against a set that
+includes the mishearings actually observed (`he`, `hay`, `hei`). Requiring
+*some* greeting is what preserves precision: bare "assistant" occurs in
+ordinary sentences ("the assistant will circulate the notes") and would fire
+on them.
+
+---
+
+## 16. Waiting for the rest of the question
+
+Even once the wake phrase matched, the answer was wrong — because the
+question was cut in half by an audio chunk boundary:
+
+```
+[ 5.0s] ...he assistant, what is the notice period?
+[10.0s] for a general meeting, let us see what it comes back with
+```
+
+Answering on the first chunk asks "what is the notice period?" and drops the
+half saying *which* notice period. The answer would have been confident and
+about the wrong thing.
+
+Nor can punctuation be trusted to signal the end: note that the recogniser
+put a question mark exactly at the cut point. It punctuates from prosody,
+and a boundary sounds like a pause.
+
+The fix is a short timer. On hearing a wake phrase the question is held, any
+chunk arriving before the timer fires is appended to it, and both paths end
+in the same place — which keeps "answer exactly once" in one spot rather
+than two. It costs about five seconds against generation that already takes
+ten to twenty.
+
+**This is compensation, not a cure.** The cause is upstream: audio sliced on
+a stopwatch rather than at pauses. Voice-activity detection removes the
+cause, and it is the first thing worth building next.
+
+---
+
+## 17. Recent discussion is pasted in, not retrieved
+
+The reflex is to run everything through the retriever. For the last few
+minutes of the meeting that is slower and strictly worse.
+
+Recent context is small, bounded and guaranteed relevant, and it fits in the
+context window comfortably. There is nothing for retrieval to do except risk
+leaving out the sentence that was just spoken. **Retrieval exists to find
+the few relevant passages among thousands that do not fit** — recent context
+is the opposite case. Not everything needs RAG.
+
+There is a practical reason too: a meeting in progress is not in the index.
+Indexing runs when it ends.
+
+One consequence worth noticing: the live path does **not** refuse when
+retrieval comes back empty, though the post-meeting path does and should.
+"What did we just decide?" is answerable entirely from the recent discussion
+and will legitimately retrieve nothing. Refusing on empty retrieval would
+break exactly the questions a live assistant is most useful for.
+
+---
+
 ## Known limitations
 
 Worth being able to name unprompted — being asked "what would you fix
@@ -398,21 +552,29 @@ first?" and having a real answer is worth more than an unbroken defence.
    them free: verify each cited claim against its chunk in a second pass,
    constrain the output format, or use a larger model.
 
-5. **Indexing transcripts is a manual step.** `scripts/index_transcripts.py`
+5. **The continuation window over-captures.** Everything in the chunk after
+   a wake phrase is appended to the question, so a question that actually
+   finished early swallows whatever was said next: *"what is the notice
+   period? for a general meeting, let us see what it comes back with..."*.
+   Retrieval is dominated by the real question so answers stay correct, and
+   over-capturing is the safer failure — under-capturing loses the question.
+   Voice-activity detection is the real fix.
+
+6. **Indexing transcripts is a manual step.** `scripts/index_transcripts.py`
    has to be run after a meeting. In a product this would be triggered by
    the WebSocket disconnecting. It is manual here because re-running it on
    demand is what you need while tuning the window size or the confidence
    floor.
 
-6. **Near-duplicate meetings are not detected.** The same audio transcribed
+7. **Near-duplicate meetings are not detected.** The same audio transcribed
    twice produces two meetings whose chunks are near-identical, and they
    will fill the top-k with the same passage twice. Handled by hand here (one
    of the two is simply not indexed). A real fix would deduplicate on
    content similarity at ingest time.
 
-7. **No evaluation set.** Retrieval quality is assessed by trying queries
+8. **No evaluation set.** Retrieval quality is assessed by trying queries
    and looking at the output. That is fine for development and not fine as
    a claim of quality. A labelled question→passage set with recall@k is what
    would turn tuning from guesswork into measurement.
 
-8. **No authentication.** Sprint 5. Every endpoint is currently open.
+9. **No authentication.** Sprint 5. Every endpoint is currently open.

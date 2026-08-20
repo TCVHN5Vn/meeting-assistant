@@ -1,20 +1,26 @@
 """
-Simulates a live audio feed by chopping a finished recording into
-fixed-length windows and sending them to the server one at a time,
-with a real delay between sends -- so the server experiences this
-exactly like it would a real live microphone stream, even though
-we're feeding it from a file for easy testing.
+Simulates a live meeting: streams a recording to the server in real time and
+renders whatever comes back.
 
-Later, swapping this file-based sender for an actual microphone
-capture is a small change -- the server side doesn't need to know
-the difference; it just receives audio_chunk bytes either way.
+Chops a finished recording into fixed-length windows and sends them one at a
+time with a real delay between sends, so the server experiences this exactly
+as it would a live microphone. Swapping this for real microphone capture is a
+small change -- the server cannot tell the difference either way.
 
-Usage:
-    python -m scripts.client_simulator sample_data/audio/short_recording.m4a [meeting_id]
+Usage (from the project root):
+    python -m scripts.client_simulator <audio> [meeting_id]
+    python -m scripts.client_simulator <audio> --ask "what is the notice period?"
+    python -m scripts.client_simulator <audio> --ask "..." --after 3
+
+--ask sends an `ask_query` event partway through the stream, which is how you
+watch the assistant answer a question WHILE transcription carries on. That
+interleaving is the thing to look for: transcript_chunk events should keep
+arriving in between the answer's fragments, not stop and wait for it.
 """
 
 import asyncio
 import io
+import json
 import sys
 import uuid
 
@@ -23,12 +29,16 @@ from pydub import AudioSegment
 
 CHUNK_MS = 5000  # 5 seconds of audio per chunk
 
+# ANSI colours: transcript in plain text, the assistant's answer in colour, so
+# the interleaving is visible at a glance rather than needing to be read.
+DIM, CYAN, YELLOW, RED, RESET = "\033[2m", "\033[36m", "\033[33m", "\033[31m", "\033[0m"
+
 
 def extract_wav_chunks(audio_path, chunk_ms=CHUNK_MS):
-    """
-    Load the whole file (pydub needs ffmpeg installed for non-wav
-    formats like m4a), downsample it to 16kHz mono (what Whisper
-    expects), then yield WAV-encoded byte chunks of `chunk_ms` each.
+    """Load the file, downsample to 16kHz mono (what Whisper expects), and
+    yield WAV-encoded byte chunks of `chunk_ms` each.
+
+    pydub needs ffmpeg installed for non-wav formats like m4a.
     """
     audio = AudioSegment.from_file(audio_path)
     audio = audio.set_frame_rate(16000).set_channels(1)
@@ -40,42 +50,102 @@ def extract_wav_chunks(audio_path, chunk_ms=CHUNK_MS):
         yield buffer.getvalue()
 
 
-async def stream_file(audio_path, meeting_id):
+def render(message: str) -> None:
+    """Print one server event in a readable form."""
+    payload = json.loads(message)
+    event, data = payload.get("event"), payload.get("data", {})
+
+    if event == "transcript_chunk":
+        print(f"{DIM}[{data['start_ts']:7.1f}s]{RESET} {data['text']}")
+
+    elif event == "qa_started":
+        trigger = data.get("trigger")
+        print(f"\n{CYAN}┌─ answering ({trigger}): {data['question']}{RESET}")
+        for i, source in enumerate(data.get("sources", []), start=1):
+            print(f"{CYAN}│  [{i}] {source['citation']} "
+                  f"({source['score']:.3f}){RESET}")
+        if data.get("live_context_chars"):
+            print(f"{CYAN}│  + {data['live_context_chars']} chars of this "
+                  f"meeting so far{RESET}")
+        print(f"{CYAN}│{RESET} ", end="", flush=True)
+
+    elif event == "qa_delta":
+        # flush=True, or the fragments sit in Python's buffer and streaming
+        # looks exactly like not streaming.
+        print(f"{CYAN}{data['text']}{RESET}", end="", flush=True)
+
+    elif event == "qa_response":
+        print(f"\n{CYAN}└─ complete ({len(data['text'])} chars){RESET}\n")
+
+    elif event == "qa_busy":
+        print(f"\n{YELLOW}[busy] {data['message']}{RESET}")
+
+    elif event in ("qa_error", "error"):
+        print(f"\n{RED}[{event}] {data.get('message')}{RESET}")
+
+    else:
+        print(f"{DIM}[{event}] {data}{RESET}")
+
+
+async def stream_file(audio_path, meeting_id, ask=None, after=2):
     uri = f"ws://localhost:8000/ws/meetings/{meeting_id}"
 
-    async with websockets.connect(uri) as websocket:
-        print(f"Connected to {uri}")
+    async with websockets.connect(uri, max_size=None) as websocket:
+        print(f"Connected to {uri}\n")
 
         async def receiver():
-            # Runs concurrently with sending -- prints responses from
-            # the server as soon as they arrive, without waiting for
-            # all chunks to finish sending first.
+            # Runs concurrently with sending, so responses appear as they
+            # arrive rather than after every chunk has been sent.
             async for message in websocket:
-                print(f"<- {message}")
+                render(message)
 
         recv_task = asyncio.create_task(receiver())
 
         chunks = list(extract_wav_chunks(audio_path))
-        print(f"Streaming {len(chunks)} chunks (~{CHUNK_MS/1000:.0f}s each)...")
+        print(f"Streaming {len(chunks)} chunks (~{CHUNK_MS / 1000:.0f}s each)...\n")
 
         for i, chunk_bytes in enumerate(chunks):
-            print(f"-> sending chunk {i} ({len(chunk_bytes)} bytes)")
             await websocket.send(chunk_bytes)
-            # Real delay, matching the chunk length, to simulate audio
-            # actually arriving in real time rather than all at once.
+
+            if ask and i == after:
+                print(f"\n{YELLOW}>> asking: {ask}{RESET}")
+                await websocket.send(json.dumps({
+                    "event": "ask_query",
+                    "data": {"text": ask},
+                }))
+
+            # A real delay matching the chunk length, so audio arrives in
+            # real time rather than all at once.
             await asyncio.sleep(CHUNK_MS / 1000)
 
-        await asyncio.sleep(3)  # let the last response arrive
+        # Generation can still be running after the last chunk was sent.
+        await asyncio.sleep(45)
         recv_task.cancel()
 
 
-if __name__ == "__main__":
-    if len(sys.argv) < 2:
-        print("Usage: python -m scripts.client_simulator path/to/audio.m4a [meeting_id]")
+def main() -> None:
+    argv = sys.argv[1:]
+    if not argv:
+        print(__doc__)
         sys.exit(1)
 
-    audio_path = sys.argv[1]
-    meeting_id = sys.argv[2] if len(sys.argv) > 2 else str(uuid.uuid4())
+    def take(flag, default=None):
+        if flag in argv:
+            index = argv.index(flag)
+            value = argv[index + 1]
+            del argv[index:index + 2]
+            return value
+        return default
+
+    ask = take("--ask")
+    after = int(take("--after", "2"))
+
+    audio_path = argv[0]
+    meeting_id = argv[1] if len(argv) > 1 else str(uuid.uuid4())
     print(f"meeting_id = {meeting_id}")
 
-    asyncio.run(stream_file(audio_path, meeting_id))
+    asyncio.run(stream_file(audio_path, meeting_id, ask=ask, after=after))
+
+
+if __name__ == "__main__":
+    main()

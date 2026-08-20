@@ -13,11 +13,11 @@ system, rather than as a wrapper around a hosted API.
    microphone / audio file
              │
              ▼
-   ┌──────────────────┐   WebSocket    ┌──────────────────┐
-   │  client (audio   │───────────────▶│  FastAPI server  │
-   │  chunks, 5s)     │◀───────────────│                  │
-   └──────────────────┘  transcript    └────────┬─────────┘
-                            chunks              │
+   ┌──────────────────┐   audio chunks ┌──────────────────┐
+   │  client          │───────────────▶│  FastAPI server  │
+   │                  │◀───────────────│                  │
+   └──────────────────┘  transcript,   └────────┬─────────┘
+                         answers               │
                                                 ▼
                                     ┌───────────────────────┐
                                     │  faster-whisper (ASR) │
@@ -69,7 +69,7 @@ can seek to: `Special General Meeting @ 33:46-35:05`.
 | 1 | Batch + streaming transcription, WebSocket, transcript storage | **Done** |
 | 2 | Chunking, embeddings, FAISS index, search API, grounded Q&A | **Done** |
 | 2.5 | Transcripts indexed alongside documents, in one shared index | **Done** |
-| 3 | Real-time Q&A during a live meeting | Not started |
+| 3 | Real-time Q&amp;A during a live meeting | **Done** |
 | 4 | Action-item extraction into structured tasks | Not started |
 | 5 | Authentication, frontend | Not started |
 
@@ -127,6 +127,37 @@ The client chops a finished recording into 5-second slices and sends them
 with a real 5-second delay between each, so the server experiences it
 exactly as it would a live microphone. Responses should arrive roughly 5
 seconds apart — that pacing is the proof it is streaming and not batching.
+
+### Ask a question during the meeting
+
+Two ways. Say it out loud, if the recording contains a wake phrase:
+
+```bash
+python -m scripts.client_simulator sample_data/audio/wake_demo.m4a
+```
+
+Or send it as an event partway through the stream:
+
+```bash
+python -m scripts.client_simulator sample_data/audio/special_general_meeting.m4a \
+  --ask "what are the three main goals of this meeting?" --after 3
+```
+
+What to watch for: **transcript lines continue arriving while the answer is
+being written.** Generation takes 10–20 seconds on a local model, and the
+meeting does not pause for it.
+
+```
+│ [   20.0s] and Juana Arrujo-Keypert and Administration Lee.
+[   23.0s] Thank you.
+The three main goals of this meeting are: ...
+```
+
+By default the assistant only speaks when addressed — `"Hey assistant, …"`.
+A meeting is full of questions people ask each other, and answering all of
+them makes an assistant that gets switched off. Set `AUTO_ANSWER_MODE` in
+[app/config.py](app/config.py) to `"questions"` to answer anything
+question-shaped, or `"off"` for explicit events only.
 
 ### Build the document index
 
@@ -190,20 +221,42 @@ curl -X POST localhost:8000/api/v1/meetings/<uuid>/index
 
 Interactive docs at `http://localhost:8000/docs`.
 
+### WebSocket events
+
+```
+client -> server   binary frame                         an audio chunk
+client -> server   {"event":"ask_query","data":{...}}    a typed question
+
+server -> client   transcript_chunk   text as it is recognised
+server -> client   qa_listening       heard a question, waiting for the rest
+server -> client   qa_started         sources, sent before generation begins
+server -> client   qa_delta           answer fragments, as they are generated
+server -> client   qa_response        the complete answer
+server -> client   qa_busy            already answering something else
+server -> client   qa_error / error
+```
+
+`qa_started` goes out before the first token because retrieval takes
+milliseconds and generation takes seconds — the client can show what is
+being read from while the model is still writing.
+
 ## Tests
 
 ```bash
 pytest tests/ -q
 ```
 
-31 tests covering the document chunker, the transcript windower, and the
-database schema — the deterministic parts. Model behaviour is not
+52 tests covering the document chunker, the transcript windower, question
+detection, and the database schema — the deterministic parts. Model behaviour is not
 unit-tested; that belongs in evaluation against a labelled question set,
 which is a separate discipline.
 
 The windowing tests earned their place immediately: one of them caught that
 overlap was being applied across silence boundaries, which is exactly where
 it should not be. See §12 of the design notes.
+
+Most of the detection tests are about what must **not** fire. Precision
+matters more than recall for a thing that interrupts a meeting.
 
 ## Layout
 
@@ -214,6 +267,7 @@ app/
   asr.py               Whisper loading and transcription
   server.py            FastAPI app: WebSocket + REST endpoints
   rag/
+    questions.py       deciding which utterances deserve an answer
     chunking.py        splitting documents into overlapping chunks
     transcripts.py     grouping ASR segments into windows; timestamps
     embeddings.py      text → 384-dim vectors

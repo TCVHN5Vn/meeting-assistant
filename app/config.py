@@ -63,6 +63,29 @@ TRANSCRIPT_GAP_SECONDS = 3.0
 # for a cleaner but smaller index.
 MIN_ASR_CONFIDENCE = -1.0
 
+# --- Live meeting Q&A ----------------------------------------------------
+# How the assistant decides to speak up mid-meeting. See app/rag/questions.py
+# for why 'wake' is the default rather than 'questions'.
+#   'wake'      only when addressed by name  (default)
+#   'questions' anything question-shaped     (noisy; good for demos)
+#   'off'       explicit ask_query events only
+AUTO_ANSWER_MODE = "wake"
+ASSISTANT_NAME = "assistant"
+# Greetings that may precede the name. The odd-looking entries -- "he",
+# "hay", "hei" -- are not typos: they are what speech recognition actually
+# returns for "hey" often enough to matter. See app/rag/questions.py.
+WAKE_GREETINGS = ("hey", "hi", "hello", "ok", "okay", "he", "hay", "hei")
+# After a wake phrase is heard, how long to keep listening before answering.
+# Audio is sliced every 5 seconds regardless of whether anyone is mid-
+# sentence, so a spoken question is routinely cut in half by a chunk
+# boundary. Slightly longer than one chunk, so exactly one continuation
+# chunk can land. See LiveSession._note_question in app/server.py.
+QUESTION_CONTINUATION_SECONDS = 6.0
+
+# How much of the meeting so far to put in the prompt verbatim, alongside
+# whatever retrieval found. See build_live_user_prompt in app/llm/prompts.py.
+LIVE_CONTEXT_SECONDS = 240.0
+
 # --- LLM ---------------------------------------------------------------
 OLLAMA_HOST = "http://localhost:11434"
 OLLAMA_MODEL = "qwen2.5:7b-instruct"

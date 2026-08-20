@@ -73,4 +73,63 @@ def build_rag_user_prompt(question: str, hits) -> str:
     )
 
 
+LIVE_SYSTEM_PROMPT = """You are a meeting assistant, answering a question \
+that was asked out loud during a meeting that is still in progress.
+
+You are given two things:
+- RECENT DISCUSSION: a verbatim transcript of the last few minutes of this \
+meeting. This is what is happening right now.
+- RETRIEVED CONTEXT: passages from company documents and from earlier \
+meetings, found by searching for the question. May be empty.
+
+Both are automatic speech recognition output where they come from audio, so \
+they contain recognition errors. Read for meaning; do not treat an odd \
+phrase as a technical term.
+
+Rules:
+- Answer from what you are given. If neither source answers it, say so \
+plainly and briefly.
+- Prefer the recent discussion for anything about what was just said, \
+decided or asked in this meeting. Prefer the retrieved context for policy, \
+process and historical fact.
+- Cite retrieved passages using their [n] numbers. The recent discussion \
+needs no citation.
+- Be brief. This is being read mid-meeting by someone who is also trying to \
+follow a conversation. Two or three sentences unless more is genuinely \
+needed."""
+
+
+def build_live_user_prompt(question: str, hits, recent_transcript: str) -> str:
+    """Assemble the prompt for a question asked during a live meeting.
+
+    RECENT DISCUSSION IS NOT RETRIEVED, IT IS PASTED IN
+
+    Worth being deliberate about, because the reflex is to run everything
+    through the retriever. The last few minutes of the meeting are a small,
+    bounded, guaranteed-relevant piece of text that comfortably fits in the
+    context window -- so there is nothing for retrieval to do except risk
+    leaving out the sentence that was just spoken.
+
+    Retrieval exists to find the few relevant passages among thousands that
+    do NOT fit. Recent context is the opposite case, and using RAG for it
+    would be slower and strictly worse. Not everything needs retrieval.
+
+    (There is also a practical reason: this meeting is still in progress, so
+    its transcript is not in the index yet. Indexing runs when the meeting
+    ends.)
+    """
+    parts = []
+    if recent_transcript.strip():
+        parts.append("RECENT DISCUSSION (this meeting, last few minutes):\n"
+                     + recent_transcript.strip())
+    if hits:
+        parts.append("RETRIEVED CONTEXT:\n" + build_context(hits))
+    if not parts:
+        parts.append("(No context available.)")
+
+    # Question last, as in the standard prompt: it is the final thing read
+    # before generation begins, which is the position with most influence.
+    return "\n\n---\n\n".join(parts) + f"\n\n---\n\nQuestion asked aloud: {question}"
+
+
 NO_CONTEXT_ANSWER = "I don't have that in the provided documents."
