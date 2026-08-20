@@ -231,7 +231,7 @@ being written.** Generation takes 10–20 seconds on a local model, and the
 meeting does not pause for it.
 
 ```
-│ [   20.0s] and Juana Arrujo-Keypert and Administration Lee.
+│ [   20.0s] and [name] and administration lead.
 [   23.0s] Thank you.
 The three main goals of this meeting are: ...
 ```

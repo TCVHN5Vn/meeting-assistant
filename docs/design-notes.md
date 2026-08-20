@@ -385,7 +385,7 @@ You can see it working in a real run — transcript lines arriving in the
 middle of the answer being written:
 
 ```
-│ [   20.0s] and Juana Arrujo-Keypert and Administration Lee.
+│ [   20.0s] and [name] and administration lead.
 [   23.0s] Thank you.
 The three main goals of this meeting are: ...
 ```
