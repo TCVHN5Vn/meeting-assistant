@@ -524,6 +524,117 @@ break exactly the questions a live assistant is most useful for.
 
 ---
 
+## 18. Cutting audio at pauses instead of on a stopwatch
+
+The root cause behind three separate problems, fixed at the source rather
+than patched where each one surfaced.
+
+Audio arrives continuously and has to be cut somewhere before Whisper sees
+it. The original client cut every five seconds on a clock, which severs
+words mid-syllable and hands the recogniser a fragment with no beginning.
+That single choice produced: garbled words at every seam, a wake phrase
+misheard as "he", and questions split across two chunks needing a timer to
+reassemble. Two of those had already been patched where they showed up.
+
+Silero VAD gives a probability of speech per 32ms window; an utterance ends
+after enough consecutive silent windows. The cut then lands in a gap.
+
+### It is measurably better, not just better in principle
+
+Same 90 seconds of meeting audio, both ways:
+
+| | fixed 5s | VAD |
+|---|---|---|
+| mean `avg_logprob` | −0.612 | **−0.432** |
+| segments below −0.7 | 6 | **2** |
+| audio pieces sent to Whisper | 18 | **8** |
+
+And on the wake-phrase clip, the same sentence before and after:
+
+```
+before:  What the policy actually says about this, he assistant,
+         what is the notice period?
+         for a general meeting, let us see what it comes back with
+         final meeting.  |  until report.
+
+after:   I think we should check what the policy actually says about this.
+         Hey assistant, what is the notice period for a general meeting?
+         And then we can move on to the financial report.
+```
+
+**"he assistant" became "Hey assistant".** The tolerant matching added in
+Sprint 3 is still there and still worth having, but the mishearing it was
+compensating for largely stopped happening once the audio stopped being cut
+through the middle of the phrase.
+
+### Why a neural VAD and not an energy threshold
+
+RMS energy is the obvious cheap approach and it cannot tell loud noise from
+speech. Measured here, Silero returns p=0.005 on random noise at speech
+amplitude — an energy detector scores that as loudly voiced. Meetings have
+chairs, doors, typing and coughs, all energetic, none worth transcribing.
+
+The recording in this repository proves the point better than the synthetic
+test. Its first two minutes have peak amplitude near clipping and
+p(speech) ≈ 0 — it is **applause**. The old pipeline fed it to Whisper,
+which hallucinated `"Thank you."` four times over it. VAD drops it.
+
+The better detector costs almost nothing: 0.1ms per window, roughly 300×
+faster than realtime.
+
+### The flag that turns a guess into a fact
+
+`Utterance.reason` records *why* the audio was cut — `silence`,
+`length_cap`, or `stream_end` — and that is worth as much as the quality
+improvement. Sprint 3 could not know whether a question was finished, so it
+waited five seconds for a continuation on *every* question. Now a question
+cut at a pause is known to be complete and is answered at once; only one cut
+by the cap waits.
+
+VAD also made a second Sprint 3 workaround unnecessary. Detection used to
+run on the whole chunk's text joined together, because a wake phrase and its
+question routinely landed in different five-second chunks. With whole
+sentences per utterance, detection runs per segment instead — so the
+question is the sentence carrying the wake phrase, not that sentence plus
+everything after it.
+
+### Two bugs the tests caught
+
+Both had one root: **the minimum-speech floor counted padding as speech.**
+
+A 250ms cough plus 300ms of pre-roll cleared a 400ms floor and got
+transcribed — and Whisper invents words for noise, which then pollutes the
+transcript and the index. The floor now counts speech windows only.
+
+The same miscounting let a pure-silence utterance be emitted after a
+length-cap cut. Fixing it exposed a second issue: the cap was being checked
+on silent windows too, so it could fire a few windows before a pause the
+speaker was already arriving at, producing a spurious "unfinished" cut right
+at a natural boundary. The cap is now checked only on speech.
+
+### What it costs
+
+Latency is no longer constant. Nothing is transcribed until the speaker
+pauses, so transcript arrives in bursts rather than every five seconds, and
+a long uninterrupted sentence produces nothing and then all of itself. The
+20-second cap bounds the worst case; on real audio the median utterance is
+about 6 seconds, so typical latency is close to what fixed chunking gave.
+
+The proper fix for that is interim results — transcribing the in-progress
+buffer periodically and emitting provisional text, finalising at the pause,
+which is how hosted streaming ASR works. It costs re-transcribing a growing
+buffer repeatedly, which is expensive on CPU. Not done here.
+
+One more thing VAD requires: an explicit end-of-stream signal. A speaker
+mid-sentence when the audio stops looks exactly like a speaker who has not
+paused yet, so the server cannot tell them apart and the last utterance
+would sit in the buffer forever. The client sends `end_audio`; a dropped
+connection falls back to flushing on disconnect, where the transcript is
+still written to the database even though there is no longer anyone to send
+it to.
+
+---
+
 ## Known limitations
 
 Worth being able to name unprompted — being asked "what would you fix
@@ -552,13 +663,9 @@ first?" and having a real answer is worth more than an unbroken defence.
    them free: verify each cited claim against its chunk in a second pass,
    constrain the output format, or use a larger model.
 
-5. **The continuation window over-captures.** Everything in the chunk after
-   a wake phrase is appended to the question, so a question that actually
-   finished early swallows whatever was said next: *"what is the notice
-   period? for a general meeting, let us see what it comes back with..."*.
-   Retrieval is dominated by the real question so answers stay correct, and
-   over-capturing is the safer failure — under-capturing loses the question.
-   Voice-activity detection is the real fix.
+5. **The VAD threshold is not tuned per environment.** 0.5 works on both
+   recordings here, but a noisy room or a distant microphone would want it
+   lower, and there is no calibration step or per-connection adaptation.
 
 6. **Indexing transcripts is a manual step.** `scripts/index_transcripts.py`
    has to be run after a meeting. In a product this would be triggered by

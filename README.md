@@ -70,6 +70,7 @@ can seek to: `Special General Meeting @ 33:46-35:05`.
 | 2 | Chunking, embeddings, FAISS index, search API, grounded Q&A | **Done** |
 | 2.5 | Transcripts indexed alongside documents, in one shared index | **Done** |
 | 3 | Real-time Q&amp;A during a live meeting | **Done** |
+| — | Voice-activity detection: cut audio at pauses, not on a clock | **Done** |
 | 4 | Action-item extraction into structured tasks | Not started |
 | 5 | Authentication, frontend | Not started |
 
@@ -78,6 +79,7 @@ can seek to: `Special General Meeting @ 33:46-35:05`.
 | Concern | Choice | Why |
 |---|---|---|
 | ASR | faster-whisper (`base`, int8) | 4× faster than reference Whisper on CPU, and releases the GIL during inference |
+| Segmentation | Silero VAD | Cuts audio at pauses rather than on a clock; rejects applause and noise that an energy threshold calls speech |
 | API | FastAPI + WebSockets | Native async; WebSocket is the right transport for a continuous audio stream |
 | Embeddings | `all-MiniLM-L6-v2` (384-dim) | Runs locally on CPU in milliseconds; small enough to be practical, good enough to be useful |
 | Vector search | FAISS `IndexFlatIP` | Exact search, no approximation error at this corpus size |
@@ -123,10 +125,12 @@ uvicorn app.server:app --reload
 python -m scripts.client_simulator sample_data/audio/short_recording.m4a
 ```
 
-The client chops a finished recording into 5-second slices and sends them
-with a real 5-second delay between each, so the server experiences it
-exactly as it would a live microphone. Responses should arrive roughly 5
-seconds apart — that pacing is the proof it is streaming and not batching.
+The client sends raw PCM in 1-second frames, in real time, so the server
+experiences it exactly as it would a live microphone. **The frames are not
+the transcription unit** — the server buffers them and cuts at pauses using
+voice-activity detection, so transcript arrives when someone stops speaking
+rather than on a fixed cadence. On the same 90 seconds of meeting audio that
+halves the number of low-confidence segments (see §18 of the design notes).
 
 ### Ask a question during the meeting
 
@@ -246,8 +250,8 @@ being read from while the model is still writing.
 pytest tests/ -q
 ```
 
-52 tests covering the document chunker, the transcript windower, question
-detection, and the database schema — the deterministic parts. Model behaviour is not
+65 tests covering the document chunker, the transcript windower, question
+detection, audio segmentation, and the database schema — the deterministic parts. Model behaviour is not
 unit-tested; that belongs in evaluation against a labelled question set,
 which is a separate discipline.
 
@@ -263,6 +267,7 @@ matters more than recall for a thing that interrupts a meeting.
 ```
 app/
   config.py            paths, model names, chunk sizes — one source of truth
+  vad.py               cutting the audio stream into utterances at pauses
   db.py                schema and all SQL for the core tables
   asr.py               Whisper loading and transcription
   server.py            FastAPI app: WebSocket + REST endpoints

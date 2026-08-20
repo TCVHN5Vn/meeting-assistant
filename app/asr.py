@@ -6,7 +6,6 @@ through here, so there is one place that decides how the model is loaded
 and what a "segment" looks like.
 """
 
-import io
 from dataclasses import dataclass
 from typing import Iterator
 
@@ -76,29 +75,20 @@ def transcribe_path(audio_path: str) -> tuple[Iterator[Segment], object]:
     return _to_segments(raw), info
 
 
-def transcribe_bytes(audio_bytes: bytes) -> tuple[list[Segment], float]:
-    """Transcribe an in-memory audio chunk. Used by the streaming server.
+def transcribe_audio(audio) -> list[Segment]:
+    """Transcribe a float32 mono waveform at 16 kHz. Used by the server.
 
-    Returns (segments, duration_seconds).
+    Takes a numpy array rather than encoded bytes. The server holds a
+    continuous stream of raw samples and cuts it at pauses, so re-encoding
+    each utterance to WAV purely to hand it back to a decoder would be work
+    done for nobody -- faster-whisper reads the array directly.
 
     Returns a LIST, not a generator. faster-whisper's segment generator is
-    lazy -- transcription only actually happens as you iterate it. Since
-    the server calls this on a worker thread specifically to keep the CPU
-    work off the event loop, we must force the work to complete HERE,
-    inside the thread. Return a lazy generator instead and the real
-    computation happens back on the event loop when the caller iterates,
-    which defeats the entire point.
-
-    The duration is returned because the caller needs it, and this is the
-    only place that knows it. Every chunk is transcribed in isolation, so
-    the timestamps below are relative to the START OF THIS CHUNK -- the
-    fortieth second of a meeting comes back labelled 0.0. Whoever is
-    assembling a whole meeting has to add a running offset, and the
-    duration of each chunk is what advances that offset.
+    lazy: transcription only really happens as you iterate it. Since the
+    server calls this on a worker thread specifically to keep the CPU work
+    off the event loop, the work must complete HERE, inside the thread.
+    Return a lazy generator and the real computation happens back on the
+    event loop when the caller iterates -- defeating the entire point.
     """
-    raw, info = get_model().transcribe(io.BytesIO(audio_bytes), beam_size=5)
-    # info.duration is the length of the decoded audio in seconds. Read it
-    # AFTER forcing the segment list: faster-whisper populates parts of
-    # `info` during transcription, not before it.
-    segments = list(_to_segments(raw))
-    return segments, info.duration
+    raw, _info = get_model().transcribe(audio, beam_size=5)
+    return list(_to_segments(raw))

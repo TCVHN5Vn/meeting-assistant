@@ -32,6 +32,32 @@ WHISPER_MODEL_SIZE = "base"
 WHISPER_DEVICE = "cpu"
 WHISPER_COMPUTE_TYPE = "int8"
 
+# --- Voice activity detection --------------------------------------------
+# Audio arrives as a continuous stream and has to be cut somewhere before
+# Whisper sees it. Cutting on a stopwatch severs words mid-syllable; cutting
+# at pauses does not. See app/vad.py.
+SAMPLE_RATE = 16000
+# Silero requires exactly this many samples per call at 16 kHz.
+VAD_WINDOW_SAMPLES = 512
+# p(speech) at or above this counts as speech.
+VAD_THRESHOLD = 0.5
+# Silence needed to declare an utterance finished. Too short and it cuts at
+# the pause between clauses; too long and every answer waits for it. 700ms
+# is comfortably longer than an inter-word gap and shorter than a turn gap.
+VAD_SILENCE_MS = 700
+# Ignore blips: a cough or a door is not an utterance.
+VAD_MIN_SPEECH_MS = 400
+# Hard cap, so an uninterrupted monologue still produces transcript rather
+# than growing a buffer forever. An utterance cut by this cap is marked as
+# unfinished -- see Utterance.ended_on_silence.
+VAD_MAX_UTTERANCE_MS = 20000
+# Audio kept from just BEFORE speech was detected. Silero reports speech a
+# beat after it starts, so without this the first consonant is clipped.
+VAD_PREROLL_MS = 300
+# Silence kept on the end, so the last word does not sound truncated to the
+# recogniser.
+VAD_TAIL_MS = 200
+
 # --- Embeddings --------------------------------------------------------
 # all-MiniLM-L6-v2: 384-dimensional vectors, ~90MB, fast on CPU. Small
 # and old-ish by 2026 standards, but it is the reference model everyone

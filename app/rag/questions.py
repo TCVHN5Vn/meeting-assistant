@@ -168,3 +168,55 @@ def detect(text: str, mode: str = AUTO_ANSWER_MODE) -> DetectedQuestion | None:
         return DetectedQuestion(text=text.strip(), trigger="question_form")
 
     return None
+
+
+def detect_in_segments(texts: list[str], mode: str = AUTO_ANSWER_MODE) -> DetectedQuestion | None:
+    """Find a question across the sentence segments of one utterance.
+
+    WHY NOT JUST JOIN THEM AND RUN detect() ON THAT
+
+    Because everything after the wake phrase would become the question. A
+    real run, one utterance, five segments:
+
+        So the next item on the agenda is the notice period.
+        I think we should check what the policy actually says.
+        Hey assistant, what is the notice period for a general meeting?
+        Let us see what it comes back with.
+        And then we can move on to the financial report.
+
+    Joined, the question comes out as "what is the notice period for a
+    general meeting? Let us see what it comes back with. And then we can move
+    on to the financial report." -- the question plus two sentences that were
+    not addressed to anyone.
+
+    Whisper's segments are sentences, so the sentence containing the wake
+    phrase is the question, and the ones after it are not. Sprint 3 joined
+    them because the wake phrase and its question routinely landed in
+    different five-second chunks; with audio cut at pauses instead, an
+    utterance holds whole sentences and the join is no longer needed.
+
+    One exception is kept: a wake phrase with nothing after it in its own
+    segment ("Hey assistant.") takes the NEXT segment as the question, since
+    the speaker addressed the assistant and then asked.
+    """
+    if mode == "off":
+        return None
+
+    for i, text in enumerate(texts):
+        asked = strip_wake_phrase(text)
+        if asked:
+            return DetectedQuestion(text=asked, trigger="wake_phrase")
+
+        # Wake phrase present but nothing after it in this sentence.
+        if asked is None and strip_wake_phrase(f"{text} placeholder") is not None:
+            following = texts[i + 1] if i + 1 < len(texts) else ""
+            if following.strip():
+                return DetectedQuestion(text=following.strip(), trigger="wake_phrase")
+            return None
+
+    if mode == "questions":
+        for text in texts:
+            if looks_like_question(text):
+                return DetectedQuestion(text=text.strip(), trigger="question_form")
+
+    return None

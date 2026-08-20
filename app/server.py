@@ -18,8 +18,11 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from pydantic import BaseModel
 
+import numpy as np
+
 from app import asr, db
 from app.config import QUESTION_CONTINUATION_SECONDS
+from app.vad import UtteranceBuffer
 from app.llm import ollama_client
 from app.rag import indexing, qa, questions, transcripts
 from app.rag.qa import DEFAULT_MIN_SCORE, DEFAULT_TOP_K
@@ -126,10 +129,12 @@ class LiveSession:
         self.conn = conn
         self.meeting_id = meeting_id
 
-        # Seconds of audio received so far. Whisper timestamps every chunk
-        # from zero, so this is what converts chunk-relative time into
-        # meeting-relative time.
-        self.offset = 0.0
+        # Accumulates the incoming stream and cuts it at pauses rather than
+        # on a stopwatch. It also owns the meeting clock: every utterance
+        # carries an absolute start time derived from the total number of
+        # samples consumed, which is exact. The old code accumulated an
+        # offset from chunk durations instead, which could drift.
+        self.buffer = UtteranceBuffer()
 
         # TWO coroutines now write to this socket: the receive loop sending
         # transcript_chunk events, and an answer task sending qa_delta
@@ -154,20 +159,57 @@ class LiveSession:
 
     # ---- inbound audio -------------------------------------------------
 
-    async def handle_audio(self, audio_bytes: bytes) -> None:
-        print(f"[{self.meeting_id}] audio chunk: {len(audio_bytes)} bytes")
+    async def handle_audio(self, frame: bytes) -> None:
+        """Take one frame of raw PCM off the wire and process any speech in it.
+
+        Frames are raw signed 16-bit mono at 16 kHz -- no container, no
+        header. The client sends short frames (~1s) so the buffer has the
+        granularity to find a pause; the frames are NOT the transcription
+        unit. Where the audio gets cut is decided here, by the voice
+        detector, not by whatever size the client happened to send.
+        """
+        # int16 -> float32 in [-1, 1], which is what both the VAD and Whisper
+        # expect. Dividing by 32768 rather than 32767 keeps the scaling
+        # exact for the most negative sample.
+        pcm = np.frombuffer(frame, dtype=np.int16).astype(np.float32) / 32768.0
+
+        # Runs on the event loop rather than a worker thread, and that is a
+        # measured decision, not an oversight. The detector costs ~0.1ms per
+        # 32ms window: about 3ms of work per second of audio, roughly 300x
+        # faster than realtime. A thread hop per frame would cost a
+        # meaningful fraction of that to save it.
+        #
+        # "Never block the event loop" is really "never block it for long".
+        # Whisper at seconds per call clearly must move off; this clearly
+        # need not. The line worth changing your mind at is around ten
+        # milliseconds per call.
+        for utterance in self.buffer.add(pcm):
+            await self.handle_utterance(utterance)
+
+    async def handle_utterance(self, utterance, notify: bool = True) -> None:
+        """Transcribe one utterance, store it, and optionally send it out.
+
+        `notify=False` is for the flush after the client has gone: the
+        transcript still belongs in the database even though there is no
+        longer anyone to send it to. Persisting and notifying are separate
+        concerns and only one of them needs a live socket.
+        """
+        print(f"[{self.meeting_id}] utterance {utterance.start:.1f}-"
+              f"{utterance.end:.1f}s ({utterance.duration:.1f}s, cut on "
+              f"{utterance.reason})")
 
         # Whisper inference is CPU-bound and takes seconds. Called directly it
         # would run ON the event loop thread and freeze the entire server.
         # A thread helps here only because CTranslate2 releases the GIL while
         # computing in C++; pure-Python CPU work would need a process pool.
-        segments, chunk_duration = await asyncio.to_thread(
-            asr.transcribe_bytes, audio_bytes
-        )
+        segments = await asyncio.to_thread(asr.transcribe_audio, utterance.audio)
 
         for segment in segments:
-            start_ts = self.offset + segment.start
-            end_ts = self.offset + segment.end
+            # Whisper timestamps each piece of audio it is given from zero,
+            # so segment times are relative to this utterance. The utterance
+            # knows where it sits in the meeting.
+            start_ts = utterance.start + segment.start
+            end_ts = utterance.start + segment.end
 
             db.insert_transcript_chunk(
                 self.conn,
@@ -178,68 +220,72 @@ class LiveSession:
                 end_ts=end_ts,
                 confidence=segment.confidence,
             )
-            await self.send(
-                "transcript_chunk",
-                text=segment.text,
-                start_ts=start_ts,
-                end_ts=end_ts,
-                confidence=segment.confidence,
-            )
+            if notify:
+                await self.send(
+                    "transcript_chunk",
+                    text=segment.text,
+                    start_ts=start_ts,
+                    end_ts=end_ts,
+                    confidence=segment.confidence,
+                )
 
-        # Advance by the AUDIO duration, not by the last segment's end. A
-        # chunk ending in silence produces no segment for that silence, so
-        # the offset would drift progressively earlier over a long meeting.
-        self.offset += chunk_duration
+        if not notify:
+            return
 
-        # Detection runs on the chunk's segments JOINED, not on each one
-        # separately: "Hey assistant," and the question after it frequently
-        # land in two adjacent segments, and neither half triggers alone.
-        spoken = " ".join(s.text for s in segments).strip()
+        spoken = [segment.text for segment in segments if segment.text.strip()]
         if not spoken:
             return
 
         if self.pending_question is not None:
-            # A question is already accumulating, so this chunk is almost
-            # certainly the rest of it. Append and let the timer fire.
-            self.pending_question = f"{self.pending_question} {spoken}".strip()
+            # A question was left open because its utterance was cut mid-
+            # sentence. This is the rest of it.
+            self.pending_question = f"{self.pending_question} {spoken[0]}".strip()
             return
 
-        detected = questions.detect(spoken)
-        if detected:
+        # Per SEGMENT, not over the joined text: Whisper's segments are
+        # sentences, so the sentence carrying the wake phrase is the question
+        # and the ones after it are not. Joining would swallow them.
+        detected = questions.detect_in_segments(spoken)
+        if not detected:
+            return
+
+        if utterance.is_complete:
+            # The speaker stopped, or the audio ended. Either way nothing
+            # more is coming, so the question is whole -- answer at once.
+            #
+            # Sprint 3 could not know this and waited five seconds for every
+            # question, for a continuation that usually never came. The voice
+            # detector does not only improve transcription; it reports WHY
+            # the audio was cut, which turns a guess into a fact.
+            self._spawn_answer(detected.text, trigger=detected.trigger)
+        else:
             await self._note_question(detected.text, detected.trigger)
 
+    async def flush_audio(self, notify: bool = True) -> None:
+        """Force out whatever speech is still buffered."""
+        final = self.buffer.flush()
+        if final is not None:
+            await self.handle_utterance(final, notify=notify)
+
     async def _note_question(self, question: str, trigger: str) -> None:
-        """Heard a question. Wait briefly for the rest of it before answering.
+        """A question whose utterance was cut mid-sentence. Wait for the rest.
 
-        WHY NOT ANSWER IMMEDIATELY
-
-        Audio is sliced every five seconds regardless of whether anyone is
-        mid-sentence, and each slice is transcribed independently. A question
-        spoken across a boundary arrives in two pieces. Observed, verbatim,
-        from a real run:
+        Only reached when the speaker was still talking when the length cap
+        hit, so the question probably continues. Answering now would ask half
+        of it -- which is what Sprint 3 did on every question, before the
+        voice detector could distinguish the two cases:
 
             [ 5.0s] ...he assistant, what is the notice period?
             [10.0s] for a general meeting, let us see what it comes back with
 
-        Answering on the first chunk asks "what is the notice period?" and
-        drops the half that says which notice period. The answer would look
-        confident and be about the wrong thing.
+        Answering on the first half asks "what is the notice period?" and
+        drops which notice period. Punctuation is no help either -- note the
+        recogniser put a question mark exactly at the cut. It punctuates from
+        prosody, and a boundary sounds like a pause.
 
-        Nor can punctuation be trusted to tell us the sentence ended -- note
-        that the recogniser put a question mark right at the cut point above.
-        It punctuates from prosody, and a boundary sounds like a pause.
-
-        So: start a short timer, and let any chunk arriving before it fires
-        extend the question. Both paths end in the same place, which keeps
-        the "answer exactly once" logic in one spot rather than two.
-
-        The cost is about five seconds of added latency, against generation
-        that already takes ten to twenty. Worth it to answer the question
-        that was actually asked.
-
-        The real fix is upstream: voice-activity detection, so audio is cut
-        at pauses instead of on a stopwatch. That removes the cause rather
-        than compensating for it, and it is the first thing to build next.
+        A short timer holds the question, any utterance arriving before it
+        fires is appended, and both paths end in the same place, keeping
+        "answer exactly once" in one spot rather than two.
         """
         self.pending_question = question
         self.pending_trigger = trigger
@@ -264,7 +310,15 @@ class LiveSession:
             return
 
         event = message.get("event")
-        if event == "ask_query":
+        if event == "end_audio":
+            # The client knows when it has stopped sending; the server cannot
+            # infer it. Without an explicit marker the last utterance sits in
+            # the buffer waiting for a closing silence that never arrives --
+            # and a speaker who was still talking when the audio ended is
+            # exactly the case where the buffer holds the most.
+            await self.flush_audio()
+            await self.send("audio_ended")
+        elif event == "ask_query":
             question = (message.get("data") or {}).get("text", "").strip()
             if not question:
                 await self.send("error", message="ask_query needs data.text")
@@ -366,7 +420,19 @@ class LiveSession:
         )
 
     async def close(self) -> None:
-        """Stop any in-flight work and release the database connection."""
+        """Stop any in-flight work and release the database connection.
+
+        Flushes the audio buffer first: whatever was being said when the
+        connection dropped never got its closing silence, and would
+        otherwise be discarded.
+        """
+        try:
+            # notify=False: the socket is gone, but the transcript still
+            # belongs in the database.
+            await self.flush_audio(notify=False)
+        except Exception as exc:  # noqa: BLE001 - best effort on a dead socket
+            print(f"[{self.meeting_id}] could not flush final utterance: {exc!r}")
+
         if self.pending_timer and not self.pending_timer.done():
             self.pending_timer.cancel()
         if self.answer_task and not self.answer_task.done():
@@ -386,13 +452,15 @@ async def ws_meeting(websocket: WebSocket, meeting_id: str):
 
     Protocol, both directions on the same socket:
 
-        client -> server  binary            an audio chunk
+        client -> server  binary            raw PCM16 mono @ 16 kHz
         client -> server  {"event": "ask_query", "data": {"text": ...}}
+    client -> server  {"event": "end_audio"}   no more audio is coming
         server -> client  transcript_chunk   text as it is recognised
         server -> client  qa_started         sources, before generation
         server -> client  qa_delta           answer fragments, as generated
         server -> client  qa_response        the complete answer
-        server -> client  qa_busy / qa_error / error
+        server -> client  audio_ended        the buffer has been flushed
+    server -> client  qa_busy / qa_error / error
     """
     await websocket.accept()
     conn = db.init_db()
@@ -412,7 +480,7 @@ async def ws_meeting(websocket: WebSocket, meeting_id: str):
                 raise WebSocketDisconnect(message.get("code", 1000))
 
             if (data := message.get("bytes")) is not None:
-                await session.handle_audio(data)
+                await session.handle_audio(data)  # raw PCM16 @ 16 kHz
             elif (text := message.get("text")) is not None:
                 await session.handle_text(text)
 

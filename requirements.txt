@@ -15,6 +15,12 @@ websockets>=13
 pydub>=0.25
 audioop-lts; python_version >= "3.13"
 
+# --- Voice activity detection ---
+# Cuts the audio stream at pauses instead of on a clock. A small neural
+# detector rather than an energy threshold: energy cannot tell applause from
+# speech, and this recording opens with two minutes of it. Pulls torchaudio.
+silero-vad>=6.0
+
 # --- RAG ---
 # sentence-transformers turns text into vectors; faiss does the nearest
 # neighbour search over those vectors.

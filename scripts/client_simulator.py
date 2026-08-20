@@ -10,16 +10,19 @@ small change -- the server cannot tell the difference either way.
 Usage (from the project root):
     python -m scripts.client_simulator <audio> [meeting_id]
     python -m scripts.client_simulator <audio> --ask "what is the notice period?"
-    python -m scripts.client_simulator <audio> --ask "..." --after 3
+    python -m scripts.client_simulator <audio> --ask "..." --after 20
 
---ask sends an `ask_query` event partway through the stream, which is how you
-watch the assistant answer a question WHILE transcription carries on. That
+--ask sends an `ask_query` event `--after` seconds into the stream, which is
+how you watch the assistant answer WHILE transcription carries on. That
 interleaving is the thing to look for: transcript_chunk events should keep
 arriving in between the answer's fragments, not stop and wait for it.
+
+Note that transcript arrives in bursts rather than steadily. That is the
+voice detector working: nothing is transcribed until the speaker pauses, so
+a long sentence produces nothing and then all of itself at once.
 """
 
 import asyncio
-import io
 import json
 import sys
 import uuid
@@ -27,27 +30,33 @@ import uuid
 import websockets
 from pydub import AudioSegment
 
-CHUNK_MS = 5000  # 5 seconds of audio per chunk
+# How much audio goes in each network frame. NOT the transcription unit --
+# the server decides where to cut, at pauses, using voice activity detection.
+# Frames only need to be small enough to give it granularity to find one.
+FRAME_MS = 1000
 
 # ANSI colours: transcript in plain text, the assistant's answer in colour, so
 # the interleaving is visible at a glance rather than needing to be read.
 DIM, CYAN, YELLOW, RED, RESET = "\033[2m", "\033[36m", "\033[33m", "\033[31m", "\033[0m"
 
 
-def extract_wav_chunks(audio_path, chunk_ms=CHUNK_MS):
-    """Load the file, downsample to 16kHz mono (what Whisper expects), and
-    yield WAV-encoded byte chunks of `chunk_ms` each.
+def extract_pcm_frames(audio_path, frame_ms=FRAME_MS):
+    """Load the file and yield raw PCM frames the server can concatenate.
+
+    Downsampled to 16 kHz mono signed 16-bit -- what both the voice detector
+    and Whisper expect. Sent raw, with no WAV header: the server holds one
+    continuous stream per connection and simply appends, so a container per
+    frame would be a header to write and parse for nothing.
 
     pydub needs ffmpeg installed for non-wav formats like m4a.
     """
     audio = AudioSegment.from_file(audio_path)
-    audio = audio.set_frame_rate(16000).set_channels(1)
+    audio = audio.set_frame_rate(16000).set_channels(1).set_sample_width(2)
 
-    for start_ms in range(0, len(audio), chunk_ms):
-        chunk = audio[start_ms:start_ms + chunk_ms]
-        buffer = io.BytesIO()
-        chunk.export(buffer, format="wav")
-        yield buffer.getvalue()
+    raw = audio.raw_data
+    bytes_per_frame = int(16000 * 2 * frame_ms / 1000)
+    for start in range(0, len(raw), bytes_per_frame):
+        yield raw[start:start + bytes_per_frame]
 
 
 def render(message: str) -> None:
@@ -77,6 +86,9 @@ def render(message: str) -> None:
     elif event == "qa_response":
         print(f"\n{CYAN}└─ complete ({len(data['text'])} chars){RESET}\n")
 
+    elif event == "audio_ended":
+        print(f"{DIM}[end of audio]{RESET}")
+
     elif event == "qa_busy":
         print(f"\n{YELLOW}[busy] {data['message']}{RESET}")
 
@@ -87,7 +99,7 @@ def render(message: str) -> None:
         print(f"{DIM}[{event}] {data}{RESET}")
 
 
-async def stream_file(audio_path, meeting_id, ask=None, after=2):
+async def stream_file(audio_path, meeting_id, ask=None, after=15):
     uri = f"ws://localhost:8000/ws/meetings/{meeting_id}"
 
     async with websockets.connect(uri, max_size=None) as websocket:
@@ -101,24 +113,33 @@ async def stream_file(audio_path, meeting_id, ask=None, after=2):
 
         recv_task = asyncio.create_task(receiver())
 
-        chunks = list(extract_wav_chunks(audio_path))
-        print(f"Streaming {len(chunks)} chunks (~{CHUNK_MS / 1000:.0f}s each)...\n")
+        frames = list(extract_pcm_frames(audio_path))
+        print(f"Streaming {len(frames)} frames of {FRAME_MS}ms "
+              f"(~{len(frames) * FRAME_MS / 1000:.0f}s of audio)...\n")
 
-        for i, chunk_bytes in enumerate(chunks):
-            await websocket.send(chunk_bytes)
+        asked = False
+        for i, frame in enumerate(frames):
+            await websocket.send(frame)
 
-            if ask and i == after:
+            if ask and not asked and i * FRAME_MS / 1000 >= after:
                 print(f"\n{YELLOW}>> asking: {ask}{RESET}")
                 await websocket.send(json.dumps({
                     "event": "ask_query",
                     "data": {"text": ask},
                 }))
+                asked = True
 
-            # A real delay matching the chunk length, so audio arrives in
+            # A real delay matching the frame length, so audio arrives in
             # real time rather than all at once.
-            await asyncio.sleep(CHUNK_MS / 1000)
+            await asyncio.sleep(FRAME_MS / 1000)
 
-        # Generation can still be running after the last chunk was sent.
+        # Tell the server no more audio is coming, so it transcribes whatever
+        # is still buffered. It cannot work this out for itself: a speaker
+        # mid-sentence when the audio ends looks exactly like a speaker who
+        # has simply not paused yet.
+        await websocket.send(json.dumps({"event": "end_audio"}))
+
+        # Generation can still be running after the last frame was sent.
         await asyncio.sleep(45)
         recv_task.cancel()
 
@@ -138,7 +159,7 @@ def main() -> None:
         return default
 
     ask = take("--ask")
-    after = int(take("--after", "2"))
+    after = float(take("--after", "15"))
 
     audio_path = argv[0]
     meeting_id = argv[1] if len(argv) > 1 else str(uuid.uuid4())
