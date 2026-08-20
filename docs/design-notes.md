@@ -744,6 +744,125 @@ the cases before reaching for a different cutoff.
 
 ---
 
+## 20. Authentication, and the mistakes it is easy to ship
+
+Security code has a property that ordinary code does not: **when it is
+wrong, everything still works.** A system that accepts forged tokens, or
+stores passwords reversibly, behaves exactly like one that does not — right
+up until it matters. There is no failing request to notice, so the decisions
+have to be made deliberately rather than discovered.
+
+### A dependency, not middleware
+
+Every protected route names `Depends(current_user)` in its signature.
+
+The alternative — middleware protecting everything except a list of exempt
+paths — **fails open**. Add a route, forget to think about the list, and it
+is public with nothing to notice. Here an unprotected route is unprotected
+because someone left the dependency out, which is visible in the diff.
+
+### 404, not 403
+
+Asking for someone else's meeting returns "not found", the same as asking
+for one that does not exist.
+
+403 would confirm the meeting is real. Any signed-in user could then
+enumerate valid meeting ids by watching which ones answer 403 and which
+answer 404. The same rule applies to tasks: the check is on the meeting the
+task belongs to, and both failures produce one 404.
+
+### Login must not reveal which emails are registered
+
+The first version looked the user up and returned early if there was none.
+That is a timing oracle: a missing account returns in microseconds, a real
+one takes the ~170ms bcrypt costs, and the difference alone enumerates the
+user table.
+
+So the password is verified against a dummy hash even when the account does
+not exist. Measured: 179ms for a real account, 171ms for a missing one —
+7ms apart, which is noise. Both return the same message, because "no such
+user" and "wrong password" are the same answer to anyone who is not the
+account holder.
+
+### The secret has no default
+
+`get_secret()` falls back to a key generated at import, not to a constant.
+
+A hardcoded development default is the most reliably shipped vulnerability
+in this class of code, precisely because it works — nobody notices, and the
+published value then forges tokens in production. A random fallback is safe
+by construction and self-announcing: tokens stop working when the server
+restarts, which is annoying in development and harmless anywhere else.
+
+A configured secret shorter than 32 bytes is **refused**, not warned about.
+RFC 7518 wants an HMAC key at least as long as the hash output, and PyJWT
+warns rather than refusing — so nothing otherwise stops a six-character
+secret in an env var. A warning in a startup log is a note nobody reads, not
+a control.
+
+### Why the WebSocket authenticates in its first message
+
+The REST API uses `Authorization: Bearer`, which is right there and wrong
+here: a browser's WebSocket API cannot set headers at all.
+
+The usual workaround is `?token=...` in the URL. It works everywhere, and it
+writes a live credential to access logs, proxy logs, browser history and
+`Referer` headers — three systems that were never thinking about secrets.
+
+So the token is the first message on the socket. One extra round trip, works
+in every client. The timeout is the part that matters: without it an
+unauthenticated connection sits open holding a slot, which is a free denial
+of service against a server that loads a speech model per process. Anything
+that is not an auth frame — audio included — closes the connection with 1008
+rather than being buffered. No work is done for a caller who has not proved
+who they are.
+
+### Password storage
+
+bcrypt at cost 12, roughly 170ms per hash here. **The slowness is the
+feature.** A general-purpose hash like SHA-256 is fast, which is exactly
+wrong: fast means billions of guesses per second against a stolen table.
+
+The salt is generated per password and stored inside the hash string, so
+there is no second column to manage and no way to reuse one. Unique salts
+are what stop a single rainbow table cracking every account at once, and
+what stop two users with the same password having visibly identical hashes.
+
+Argon2id is the stronger modern choice, being memory-hard as well as slow,
+which blunts GPU parallelism specifically. bcrypt remains acceptable and is
+chosen here for having exactly one parameter to get wrong.
+
+### `algorithms=` is not optional
+
+`jwt.decode(token, key, algorithms=["HS256"])`. A decoder that trusts the
+`alg` header in the token itself accepts `alg: none` — an unsigned token
+that verifies against anything. PyJWT makes the list mandatory, which is a
+library making the safe thing compulsory rather than merely available.
+There is a test for it.
+
+### The migration trap
+
+Adding `created_by` to the schema changed nothing for any database that
+already existed, because `CREATE TABLE IF NOT EXISTS` does exactly nothing
+when the table is there — including when the definition has grown a column
+since. The code then failed reading a column SQLite said did not exist.
+
+That is the flaw in "the schema is just a CREATE TABLE script": it is
+correct only for a fresh database. Real migrations need a real mechanism.
+`_migrate` in `app/db.py` is the smallest honest one — SQLite has no ADD
+COLUMN IF NOT EXISTS, so the existing columns are read first and only the
+missing ones are added.
+
+### Accounts are created from a script, not a /register endpoint
+
+Open registration is a product decision, and shipping one by default decides
+it silently. On a self-hosted meeting recorder, "anyone who can reach the
+port can create an account" is almost never what was wanted. A registration
+endpoint can be added deliberately, with whatever invite or domain
+restriction the deployment actually needs.
+
+---
+
 ## Known limitations
 
 Worth being able to name unprompted — being asked "what would you fix
@@ -807,4 +926,18 @@ first?" and having a real answer is worth more than an unbroken defence.
    a claim of quality. A labelled question→passage set with recall@k is what
    would turn tuning from guesswork into measurement.
 
-12. **No authentication.** Sprint 5. Every endpoint is currently open.
+12. **No frontend.** Sprint 5's other half. Everything is a terminal or a
+    curl, which is the main thing standing between this and being legible to
+    someone who is not reading code.
+
+13. **No token refresh or revocation.** A token is valid for 12 hours and
+    cannot be invalidated before then — revoking access means rotating the
+    signing key, which logs everyone out. A refresh token plus a short-lived
+    access token is the usual answer; a deny-list is the other.
+
+14. **No rate limiting on login.** Nothing slows down an attacker trying
+    passwords beyond bcrypt's own cost, which is a real but shallow defence.
+
+15. **Documents are not scoped to a user.** Meetings and tasks are; the RAG
+    corpus is shared by everyone with an account. That is deliberate for a
+    single-organisation deployment and wrong for a multi-tenant one.

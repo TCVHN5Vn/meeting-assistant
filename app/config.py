@@ -112,6 +112,15 @@ QUESTION_CONTINUATION_SECONDS = 6.0
 # whatever retrieval found. See build_live_user_prompt in app/llm/prompts.py.
 LIVE_CONTEXT_SECONDS = 240.0
 
+# --- Authentication ------------------------------------------------------
+JWT_ALGORITHM = "HS256"
+# Short enough that a leaked token stops working the same day, long enough
+# that a meeting does not end with everyone logged out. There is no refresh
+# token here, so this is the whole session lifetime.
+JWT_TTL_HOURS = 12
+# How long a WebSocket may stay open before authenticating. See ws_meeting.
+WS_AUTH_TIMEOUT_SECONDS = 5.0
+
 # --- LLM ---------------------------------------------------------------
 OLLAMA_HOST = "http://localhost:11434"
 OLLAMA_MODEL = "qwen2.5:7b-instruct"

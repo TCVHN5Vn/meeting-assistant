@@ -15,8 +15,12 @@ import json
 import uuid
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
+from fastapi import Depends, FastAPI, HTTPException, WebSocket, WebSocketDisconnect
+from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel
+
+from app import auth
+from app.config import WS_AUTH_TIMEOUT_SECONDS
 
 import numpy as np
 
@@ -49,8 +53,113 @@ async def lifespan(app: FastAPI):
 app = FastAPI(title="Meeting Assistant", lifespan=lifespan)
 
 
+# --- Authentication ------------------------------------------------------
+#
+# auto_error=False so a missing header reaches our own handler rather than
+# producing FastAPI's default 403. Missing credentials and bad credentials
+# should both be 401 -- 403 means "I know who you are and you still may not",
+# which is a different thing and misleads whoever is debugging a client.
+_bearer = HTTPBearer(auto_error=False)
+
+
+def current_user(
+    credentials: HTTPAuthorizationCredentials | None = Depends(_bearer),
+):
+    """Resolve the caller from their bearer token, or refuse.
+
+    A dependency rather than middleware, so that protection is visible in
+    each route's signature. Middleware that protects "everything except a
+    list of paths" fails open: add a route, forget the list, and it is
+    public with nothing to notice. Here an unprotected route is unprotected
+    because someone left the dependency out, which shows up in review.
+    """
+    if credentials is None:
+        raise HTTPException(status_code=401, detail="authentication required",
+                            headers={"WWW-Authenticate": "Bearer"})
+
+    user_id = auth.decode_token(credentials.credentials)
+    if user_id is None:
+        raise HTTPException(status_code=401, detail="invalid or expired token",
+                            headers={"WWW-Authenticate": "Bearer"})
+
+    conn = db.init_db()
+    try:
+        user = db.get_user(conn, user_id)
+    finally:
+        conn.close()
+
+    if user is None:
+        # A validly signed token for a user who no longer exists. The
+        # signature proves the token was issued by us; it does not prove the
+        # account still exists, and only the database knows that.
+        raise HTTPException(status_code=401, detail="user no longer exists")
+    return user
+
+
+def require_meeting_access(meeting_id: str, user) -> None:
+    """404 unless this user may see this meeting.
+
+    404 and not 403, deliberately. Answering "forbidden" for a meeting that
+    exists and "not found" for one that does not lets anyone with a valid
+    login enumerate which meeting ids are real. Both cases look identical
+    from outside.
+    """
+    conn = db.init_db()
+    try:
+        if not db.user_can_access_meeting(conn, user["id"], meeting_id):
+            raise HTTPException(status_code=404, detail="meeting not found")
+    finally:
+        conn.close()
+
+
+class LoginRequest(BaseModel):
+    email: str
+    password: str
+
+
+@app.post("/api/v1/auth/login")
+def login(request: LoginRequest):
+    """Exchange email and password for a token."""
+    conn = db.init_db()
+    try:
+        user = db.get_user_by_email(conn, request.email)
+    finally:
+        conn.close()
+
+    # The password is verified even when the user does not exist, against a
+    # dummy hash. Otherwise a missing account returns in microseconds and a
+    # real one takes the ~170ms bcrypt costs, and that difference alone tells
+    # an attacker which email addresses are registered.
+    stored = user["password_hash"] if user else _DUMMY_HASH
+    valid = auth.verify_password(request.password, stored)
+
+    if user is None or not valid:
+        # One message for both cases. "No such user" and "wrong password"
+        # are the same answer to anyone who is not the account holder.
+        raise HTTPException(status_code=401, detail="invalid email or password")
+
+    return {
+        "access_token": auth.create_token(user["id"]),
+        "token_type": "bearer",
+        "user": {"id": user["id"], "email": user["email"], "name": user["name"]},
+    }
+
+
+# Computed once at import: hashing costs ~170ms and this exists purely to
+# burn the same time on a failed lookup as on a real one.
+_DUMMY_HASH = auth.hash_password("not-a-real-password")
+
+
+@app.get("/api/v1/auth/me")
+def me(user=Depends(current_user)):
+    return {"id": user["id"], "email": user["email"],
+            "name": user["name"], "role": user["role"]}
+
+
 @app.get("/health")
 def health():
+    """Unauthenticated on purpose: a health check that needs credentials
+    cannot be used by the thing that restarts the process."""
     return {"status": "ok"}
 
 
@@ -447,12 +556,84 @@ class LiveSession:
         self.conn.close()
 
 
+async def authenticate_websocket(websocket: WebSocket):
+    """Require an auth frame before anything else. Returns the user or None.
+
+    WHY NOT A HEADER, AND WHY NOT A QUERY PARAMETER
+
+    The REST API uses `Authorization: Bearer ...`, which is the right answer
+    there. A browser's WebSocket API cannot set headers at all, so that is
+    unavailable for the one client this most needs to work for.
+
+    The usual workaround is `?token=...` in the URL. It works everywhere and
+    it puts a live credential somewhere URLs habitually end up: access logs,
+    proxy logs, browser history, `Referer`. A token that grants a session
+    should not be written to disk by three systems that were never thinking
+    about secrets.
+
+    So the token is sent as the first message on the socket instead. It costs
+    one round trip and works in every client, browsers included.
+
+    The timeout is the point of the exercise. Without it an unauthenticated
+    connection can sit open forever holding a slot, which is a free denial of
+    service against a server that loads a speech model per process.
+    """
+    try:
+        message = await asyncio.wait_for(
+            websocket.receive(), timeout=WS_AUTH_TIMEOUT_SECONDS)
+    except (asyncio.TimeoutError, TimeoutError):
+        await websocket.close(code=1008, reason="authentication timed out")
+        return None
+    except (WebSocketDisconnect, RuntimeError):
+        return None
+
+    if message["type"] == "websocket.disconnect":
+        return None
+
+    # Audio before authentication is refused rather than buffered. Doing any
+    # work for an unauthenticated connection is the thing to avoid.
+    raw = message.get("text")
+    if raw is None:
+        await websocket.close(code=1008, reason="expected an auth message")
+        return None
+
+    try:
+        payload = json.loads(raw)
+    except json.JSONDecodeError:
+        await websocket.close(code=1008, reason="expected an auth message")
+        return None
+
+    if payload.get("event") != "auth":
+        await websocket.close(code=1008, reason="first message must be auth")
+        return None
+
+    token = (payload.get("data") or {}).get("token", "")
+    user_id = auth.decode_token(token)
+    if user_id is None:
+        await websocket.close(code=1008, reason="invalid or expired token")
+        return None
+
+    conn = db.init_db()
+    try:
+        user = db.get_user(conn, user_id)
+    finally:
+        conn.close()
+
+    if user is None:
+        await websocket.close(code=1008, reason="user no longer exists")
+        return None
+    return user
+
+
 @app.websocket("/ws/meetings/{meeting_id}")
 async def ws_meeting(websocket: WebSocket, meeting_id: str):
     """One WebSocket connection = one live meeting session.
 
-    Protocol, both directions on the same socket:
+    Protocol, both directions on the same socket. The FIRST message must be
+    an auth frame; anything else closes the connection with 1008.
 
+        client -> server  {"event": "auth", "data": {"token": ...}}
+        server -> client  authenticated      auth accepted
         client -> server  binary            raw PCM16 mono @ 16 kHz
         client -> server  {"event": "ask_query", "data": {"text": ...}}
     client -> server  {"event": "end_audio"}   no more audio is coming
@@ -464,9 +645,32 @@ async def ws_meeting(websocket: WebSocket, meeting_id: str):
     server -> client  qa_busy / qa_error / error
     """
     await websocket.accept()
+
+    user = await authenticate_websocket(websocket)
+    if user is None:
+        return  # authenticate_websocket has already closed the socket
+
     conn = db.init_db()
-    db.create_meeting(conn, meeting_id, title="Live Meeting")
-    print(f"[{meeting_id}] client connected")
+
+    # An existing meeting belonging to someone else is refused. A new one is
+    # created owned by this user. Note the order: nothing is written to the
+    # database until the caller has been authenticated AND authorized.
+    existing = conn.execute(
+        "SELECT created_by FROM meetings WHERE id = ?", (meeting_id,)).fetchone()
+    if existing is not None and not db.user_can_access_meeting(
+            conn, user["id"], meeting_id):
+        conn.close()
+        await websocket.close(code=1008, reason="meeting not found")
+        return
+
+    db.create_meeting(conn, meeting_id, title="Live Meeting",
+                      created_by=user["id"])
+    print(f"[{meeting_id}] client connected as {user['email']}")
+
+    await websocket.send_json({
+        "event": "authenticated",
+        "data": {"user": user["email"], "meeting_id": meeting_id},
+    })
 
     session = LiveSession(websocket, conn, meeting_id)
 
@@ -492,15 +696,19 @@ async def ws_meeting(websocket: WebSocket, meeting_id: str):
 
 
 @app.get("/api/v1/meetings")
-def list_meetings():
+def list_meetings(user=Depends(current_user)):
+    """This user's meetings, plus any that predate authentication."""
     conn = db.init_db()
     try:
         rows = conn.execute(
-            """SELECT m.id, m.title, m.created_at, COUNT(c.id) AS chunk_count
+            """SELECT m.id, m.title, m.created_at, m.created_by,
+                      COUNT(c.id) AS chunk_count
                FROM meetings m
                LEFT JOIN transcript_chunks c ON c.meeting_id = m.id
+               WHERE m.created_by = ? OR m.created_by IS NULL
                GROUP BY m.id
-               ORDER BY m.created_at DESC"""
+               ORDER BY m.created_at DESC""",
+            (user["id"],),
         ).fetchall()
         return [dict(r) for r in rows]
     finally:
@@ -508,7 +716,8 @@ def list_meetings():
 
 
 @app.get("/api/v1/meetings/{meeting_id}/transcript")
-def get_transcript(meeting_id: str):
+def get_transcript(meeting_id: str, user=Depends(current_user)):
+    require_meeting_access(meeting_id, user)
     conn = db.init_db()
     try:
         meeting = conn.execute(
@@ -549,13 +758,13 @@ class AskRequest(BaseModel):
 
 
 @app.get("/api/v1/index/stats")
-def index_stats_endpoint():
+def index_stats_endpoint(user=Depends(current_user)):
     """Corpus size, and whether SQLite and FAISS still agree with each other."""
     return indexing.index_stats()
 
 
 @app.post("/api/v1/meetings/{meeting_id}/index")
-async def index_meeting_endpoint(meeting_id: str):
+async def index_meeting_endpoint(meeting_id: str, user=Depends(current_user)):
     """Make one meeting's transcript searchable.
 
     In a finished product this would be triggered automatically when the
@@ -565,6 +774,7 @@ async def index_meeting_endpoint(meeting_id: str):
     On a worker thread because it embeds every chunk in the corpus, which
     takes seconds and would otherwise block every other request.
     """
+    require_meeting_access(meeting_id, user)
     def work() -> dict:
         conn = db.init_db()
         try:
@@ -587,8 +797,9 @@ class TaskStatusRequest(BaseModel):
 
 
 @app.get("/api/v1/meetings/{meeting_id}/tasks")
-def list_tasks(meeting_id: str):
+def list_tasks(meeting_id: str, user=Depends(current_user)):
     """Action items already extracted from this meeting."""
+    require_meeting_access(meeting_id, user)
     conn = db.init_db()
     try:
         return {"meeting_id": meeting_id,
@@ -598,7 +809,7 @@ def list_tasks(meeting_id: str):
 
 
 @app.post("/api/v1/meetings/{meeting_id}/tasks")
-async def extract_tasks(meeting_id: str):
+async def extract_tasks(meeting_id: str, user=Depends(current_user)):
     """Extract action items from a meeting's transcript.
 
     Slow -- one model call per window, minutes on a long meeting -- and
@@ -608,6 +819,8 @@ async def extract_tasks(meeting_id: str):
     clients, and a job queue with one consumer is machinery without a
     purpose.
     """
+    require_meeting_access(meeting_id, user)
+
     def work() -> dict:
         conn = db.init_db()
         try:
@@ -626,7 +839,7 @@ async def extract_tasks(meeting_id: str):
 
 
 @app.patch("/api/v1/tasks/{task_id}")
-def update_task(task_id: str, request: TaskStatusRequest):
+def update_task(task_id: str, request: TaskStatusRequest, user=Depends(current_user)):
     """Mark a task done, or reopen it."""
     allowed = {"open", "done", "cancelled"}
     if request.status not in allowed:
@@ -636,6 +849,15 @@ def update_task(task_id: str, request: TaskStatusRequest):
 
     conn = db.init_db()
     try:
+        # Which meeting the task belongs to decides who may touch it. Without
+        # this check, any signed-in user could close anyone's action items by
+        # guessing an id -- authenticated but not authorized.
+        row = conn.execute(
+            "SELECT meeting_id FROM tasks WHERE id = ?", (task_id,)).fetchone()
+        if row is None or not db.user_can_access_meeting(
+                conn, user["id"], row["meeting_id"]):
+            raise HTTPException(status_code=404, detail="task not found")
+
         if not db.set_task_status(conn, task_id, request.status):
             raise HTTPException(status_code=404, detail="task not found")
         return {"id": task_id, "status": request.status}
@@ -644,7 +866,7 @@ def update_task(task_id: str, request: TaskStatusRequest):
 
 
 @app.post("/api/v1/search")
-def search_documents(request: SearchRequest):
+def search_documents(request: SearchRequest, user=Depends(current_user)):
     """Semantic search over the ingested documents. No LLM involved."""
     try:
         hits = retrieve(
@@ -663,7 +885,7 @@ def search_documents(request: SearchRequest):
 
 
 @app.post("/api/v1/ask")
-async def ask(request: AskRequest):
+async def ask(request: AskRequest, user=Depends(current_user)):
     """Full RAG: retrieve, then generate a grounded answer with citations.
 
     Wrapped in to_thread for the same reason as Whisper in the WebSocket

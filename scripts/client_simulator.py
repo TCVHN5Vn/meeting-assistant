@@ -8,9 +8,13 @@ as it would a live microphone. Swapping this for real microphone capture is a
 small change -- the server cannot tell the difference either way.
 
 Usage (from the project root):
-    python -m scripts.client_simulator <audio> [meeting_id]
+    python -m scripts.client_simulator <audio> --email you@example.com
+    python -m scripts.client_simulator <audio> --token <jwt>
     python -m scripts.client_simulator <audio> --ask "what is the notice period?"
-    python -m scripts.client_simulator <audio> --ask "..." --after 20
+
+The server requires authentication. Pass --email to log in (you will be
+prompted for the password), or --token directly, or set
+MEETING_ASSISTANT_TOKEN in the environment.
 
 --ask sends an `ask_query` event `--after` seconds into the stream, which is
 how you watch the assistant answer WHILE transcription carries on. That
@@ -23,12 +27,17 @@ a long sentence produces nothing and then all of itself at once.
 """
 
 import asyncio
+import getpass
 import json
+import os
 import sys
 import uuid
 
+import httpx
 import websockets
 from pydub import AudioSegment
+
+SERVER = "http://localhost:8000"
 
 # How much audio goes in each network frame. NOT the transcription unit --
 # the server decides where to cut, at pauses, using voice activity detection.
@@ -86,6 +95,9 @@ def render(message: str) -> None:
     elif event == "qa_response":
         print(f"\n{CYAN}└─ complete ({len(data['text'])} chars){RESET}\n")
 
+    elif event == "authenticated":
+        pass  # already reported by stream_file
+
     elif event == "audio_ended":
         print(f"{DIM}[end of audio]{RESET}")
 
@@ -99,11 +111,38 @@ def render(message: str) -> None:
         print(f"{DIM}[{event}] {data}{RESET}")
 
 
-async def stream_file(audio_path, meeting_id, ask=None, after=15):
+def get_token(email=None, token=None) -> str:
+    """Find a token: the flag, the environment, or by logging in."""
+    token = token or os.environ.get("MEETING_ASSISTANT_TOKEN")
+    if token:
+        return token
+    if not email:
+        print("Need --email or --token (or MEETING_ASSISTANT_TOKEN).")
+        sys.exit(1)
+
+    password = getpass.getpass(f"Password for {email}: ")
+    response = httpx.post(f"{SERVER}/api/v1/auth/login",
+                          json={"email": email, "password": password}, timeout=30)
+    if response.status_code != 200:
+        print(f"Login failed: {response.json().get('detail')}")
+        sys.exit(1)
+    return response.json()["access_token"]
+
+
+async def stream_file(audio_path, meeting_id, token, ask=None, after=15):
     uri = f"ws://localhost:8000/ws/meetings/{meeting_id}"
 
     async with websockets.connect(uri, max_size=None) as websocket:
-        print(f"Connected to {uri}\n")
+        # The token goes in the first MESSAGE, not the URL. A browser cannot
+        # set headers on a WebSocket, and "?token=..." would write a live
+        # credential into access logs, proxy logs and browser history.
+        await websocket.send(json.dumps({"event": "auth", "data": {"token": token}}))
+
+        reply = json.loads(await websocket.recv())
+        if reply.get("event") != "authenticated":
+            print(f"Authentication failed: {reply}")
+            return
+        print(f"Connected to {uri} as {reply['data']['user']}\n")
 
         async def receiver():
             # Runs concurrently with sending, so responses appear as they
@@ -160,12 +199,16 @@ def main() -> None:
 
     ask = take("--ask")
     after = float(take("--after", "15"))
+    email = take("--email")
+    token = take("--token")
 
     audio_path = argv[0]
     meeting_id = argv[1] if len(argv) > 1 else str(uuid.uuid4())
+
+    token = get_token(email=email, token=token)
     print(f"meeting_id = {meeting_id}")
 
-    asyncio.run(stream_file(audio_path, meeting_id, ask=ask, after=after))
+    asyncio.run(stream_file(audio_path, meeting_id, token, ask=ask, after=after))
 
 
 if __name__ == "__main__":

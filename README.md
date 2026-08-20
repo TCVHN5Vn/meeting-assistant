@@ -72,7 +72,8 @@ can seek to: `Special General Meeting @ 33:46-35:05`.
 | 3 | Real-time Q&amp;A during a live meeting | **Done** |
 | — | Voice-activity detection: cut audio at pauses, not on a clock | **Done** |
 | 4 | Action-item extraction into structured tasks | **Done** |
-| 5 | Authentication, frontend | Not started |
+| 5a | JWT authentication, meeting ownership | **Done** |
+| 5b | Frontend | Not started |
 
 ## Stack
 
@@ -85,6 +86,41 @@ can seek to: `Special General Meeting @ 33:46-35:05`.
 | Vector search | FAISS `IndexFlatIP` | Exact search, no approximation error at this corpus size |
 | LLM | Ollama + `qwen2.5:7b-instruct` | Local, free, private; strong at instruction-following and structured output |
 | Database | SQLite | Zero setup; the schema is written so a Postgres migration is mechanical |
+
+## Authentication
+
+Every `/api/v1` endpoint and the WebSocket require a bearer token. Create an
+account from the machine running the server:
+
+```bash
+python -m scripts.create_user you@example.com "Your Name"
+python -m scripts.create_user --list
+```
+
+There is deliberately **no `/register` endpoint** — open registration is a
+product decision, and shipping one by default decides it silently.
+
+```bash
+# Get a token
+curl -X POST localhost:8000/api/v1/auth/login \
+  -H 'content-type: application/json' \
+  -d '{"email": "you@example.com", "password": "..."}'
+
+export MEETING_ASSISTANT_TOKEN=<the access_token>
+```
+
+Set a signing key in production, or tokens are invalidated on every restart:
+
+```bash
+export MEETING_ASSISTANT_SECRET=$(python -c 'import secrets; print(secrets.token_hex(32))')
+```
+
+A key shorter than 32 bytes is refused at startup rather than warned about.
+
+The WebSocket authenticates with its **first message**, not a query
+parameter — a browser cannot set headers on a WebSocket, and `?token=` would
+write a live credential into access logs and browser history. See §20 of the
+design notes.
 
 ## Setup
 
@@ -122,7 +158,8 @@ Two terminals.
 uvicorn app.server:app --reload
 
 # Terminal 2 — a simulated live microphone
-python -m scripts.client_simulator sample_data/audio/short_recording.m4a
+python -m scripts.client_simulator sample_data/audio/short_recording.m4a \
+  --email you@example.com
 ```
 
 The client sends raw PCM in 1-second frames, in real time, so the server
@@ -239,8 +276,11 @@ found and the model still got it wrong). Those have different fixes.
 
 ### HTTP API
 
+All calls need `Authorization: Bearer $MEETING_ASSISTANT_TOKEN`.
+
 ```bash
-curl localhost:8000/api/v1/index/stats
+curl -H "Authorization: Bearer $MEETING_ASSISTANT_TOKEN" \
+  localhost:8000/api/v1/index/stats
 
 curl -X POST localhost:8000/api/v1/search \
   -H 'content-type: application/json' \
@@ -292,8 +332,9 @@ being read from while the model is still writing.
 pytest tests/ -q
 ```
 
-100 tests covering the document chunker, the transcript windower, question
-detection, audio segmentation, action-item verification, and the schema — the deterministic parts. Model behaviour is not
+121 tests covering the document chunker, the transcript windower, question
+detection, audio segmentation, action-item verification, authentication,
+and the schema — the deterministic parts. Model behaviour is not
 unit-tested; that belongs in evaluation against a labelled question set,
 which is a separate discipline.
 
@@ -309,6 +350,7 @@ matters more than recall for a thing that interrupts a meeting.
 ```
 app/
   config.py            paths, model names, chunk sizes — one source of truth
+  auth.py              password hashing, tokens, access control
   vad.py               cutting the audio stream into utterances at pauses
   tasks.py             extracting action items, and verifying they are real
   db.py                schema and all SQL for the core tables

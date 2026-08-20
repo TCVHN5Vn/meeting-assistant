@@ -26,9 +26,26 @@ from app.config import DB_PATH, ensure_dirs
 # comment on it below.
 
 SCHEMA = """
+CREATE TABLE IF NOT EXISTS users (
+    id             TEXT PRIMARY KEY,
+    email          TEXT UNIQUE NOT NULL,
+    name           TEXT,
+    -- The bcrypt hash, never the password. bcrypt stores its salt and cost
+    -- factor inside the hash string, so there is no second column to keep
+    -- alongside it and no way to accidentally reuse a salt.
+    password_hash  TEXT NOT NULL,
+    role           TEXT DEFAULT 'member',
+    created_at     TEXT
+);
+
 CREATE TABLE IF NOT EXISTS meetings (
     id          TEXT PRIMARY KEY,
     title       TEXT,
+    -- Who owns this meeting. NULL means it predates authentication: those
+    -- rows stay readable by any signed-in user rather than being orphaned
+    -- or silently reassigned to whoever registers first. A migration
+    -- compromise, and marked as one.
+    created_by  TEXT REFERENCES users(id),
     created_at  TEXT
 );
 
@@ -160,6 +177,33 @@ CREATE INDEX IF NOT EXISTS idx_ragchunks_vector ON rag_chunks(vector_id);
 CREATE INDEX IF NOT EXISTS idx_ragchunks_source ON rag_chunks(source_type, source_id);
 """
 
+# Columns added to tables that already existed in someone's database.
+#
+# CREATE TABLE IF NOT EXISTS does exactly nothing when the table is already
+# there -- including when the definition in this file has grown a column
+# since. So adding `created_by` to the schema above changed nothing for any
+# database created before it, and the code would then fail at runtime
+# reading a column SQLite says does not exist.
+#
+# This is the trap in "the schema is just a CREATE TABLE script": it is
+# correct only for a fresh database. Real migrations need a real mechanism.
+# This is the smallest honest one -- SQLite has no ADD COLUMN IF NOT EXISTS,
+# so existing columns are read first and only the missing ones are added.
+ADDED_COLUMNS = {
+    "meetings": [("created_by", "TEXT REFERENCES users(id)")],
+}
+
+
+def _migrate(conn) -> None:
+    for table, columns in ADDED_COLUMNS.items():
+        existing = {row[1] for row in conn.execute(f"PRAGMA table_info({table})")}
+        for name, definition in columns:
+            if name not in existing:
+                conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {definition}")
+                print(f"migration: added {table}.{name}")
+    conn.commit()
+
+
 # Tables that earlier versions of this project created and no longer uses.
 # Everything in them is derived from files on disk or from transcript_chunks,
 # so dropping is safe -- nothing here is a source of truth.
@@ -204,13 +248,15 @@ def init_db() -> sqlite3.Connection:
     conn = get_connection()
     conn.executescript(SCHEMA)
     conn.commit()
+    _migrate(conn)
     _drop_deprecated(conn)
     return conn
 
 
 # --- Meetings ----------------------------------------------------------
 
-def create_meeting(conn: sqlite3.Connection, meeting_id: str, title: str) -> None:
+def create_meeting(conn: sqlite3.Connection, meeting_id: str, title: str,
+                   created_by: str | None = None) -> None:
     """Register a meeting. Safe to call again for an existing id.
 
     INSERT OR IGNORE rather than INSERT: if a client drops its WebSocket
@@ -218,8 +264,9 @@ def create_meeting(conn: sqlite3.Connection, meeting_id: str, title: str) -> Non
     to that meeting, not crash on a primary key collision.
     """
     conn.execute(
-        "INSERT OR IGNORE INTO meetings (id, title, created_at) VALUES (?, ?, ?)",
-        (meeting_id, title, utc_now()),
+        """INSERT OR IGNORE INTO meetings (id, title, created_by, created_at)
+           VALUES (?, ?, ?, ?)""",
+        (meeting_id, title, created_by, utc_now()),
     )
     conn.commit()
 
@@ -293,3 +340,44 @@ def set_task_status(conn, task_id: str, status: str) -> bool:
         "UPDATE tasks SET status = ? WHERE id = ?", (status, task_id))
     conn.commit()
     return cursor.rowcount > 0
+
+
+# --- Users --------------------------------------------------------------
+
+def create_user(conn, user_id: str, email: str, name: str,
+                password_hash: str, role: str = "member") -> None:
+    conn.execute(
+        """INSERT INTO users (id, email, name, password_hash, role, created_at)
+           VALUES (?, ?, ?, ?, ?, ?)""",
+        # Emails are stored lowercased so that "A@b.com" and "a@b.com" cannot
+        # become two accounts. The UNIQUE constraint is case-SENSITIVE, so
+        # normalising has to happen here, before it ever reaches the index.
+        (user_id, email.strip().lower(), name, password_hash, role, utc_now()),
+    )
+    conn.commit()
+
+
+def get_user_by_email(conn, email: str):
+    return conn.execute(
+        "SELECT * FROM users WHERE email = ?", (email.strip().lower(),)
+    ).fetchone()
+
+
+def get_user(conn, user_id: str):
+    return conn.execute("SELECT * FROM users WHERE id = ?", (user_id,)).fetchone()
+
+
+def user_can_access_meeting(conn, user_id: str, meeting_id: str) -> bool:
+    """Does this user own the meeting -- or is it unowned legacy data?
+
+    Returns False for a meeting that does not exist, which is deliberate: the
+    caller turns both cases into the same 404. Answering "not found" for
+    someone else's meeting and "forbidden" for one that exists would let an
+    unauthenticated prober enumerate which meeting ids are real.
+    """
+    row = conn.execute(
+        "SELECT created_by FROM meetings WHERE id = ?", (meeting_id,)
+    ).fetchone()
+    if row is None:
+        return False
+    return row["created_by"] is None or row["created_by"] == user_id
