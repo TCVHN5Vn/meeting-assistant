@@ -401,5 +401,9 @@ tests/                 unit tests
 data/                  database + FAISS index (gitignored, regenerable)
 ```
 
-Design decisions and their tradeoffs are written up in
-[docs/design-notes.md](docs/design-notes.md).
+## Documentation
+
+| Document | What it is for |
+|---|---|
+| **[docs/PROJECT-GUIDE.md](docs/PROJECT-GUIDE.md)** | **Start here.** A complete explanation of the project: what every technical term means, how each stage works and why it was built that way, a file-by-file reference, and every problem that had to be solved. Written to be read start to finish. |
+| [docs/design-notes.md](docs/design-notes.md) | Twenty-one design decisions, each with the alternative that was rejected and what it would have cost. Reference, not narrative. |
