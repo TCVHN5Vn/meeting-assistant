@@ -3,7 +3,9 @@ Ask a question against the ingested documents, from the terminal.
 
 Usage (from the project root):
     python -m scripts.ask "what is the deployment process?"
-    python -m scripts.ask "..." --no-llm     # show retrieval only
+    python -m scripts.ask "..." --no-llm       # show retrieval only
+    python -m scripts.ask "..." --documents    # written policies only
+    python -m scripts.ask "..." --transcripts  # what was actually said only
 
 --no-llm skips generation and prints the raw retrieved chunks. Use it when
 an answer looks wrong: it tells you immediately whether the problem is bad
@@ -26,8 +28,8 @@ def show_sources(hits) -> None:
         return
     print("Sources:")
     for i, hit in enumerate(hits, start=1):
-        print(f"  [{i}] {hit.document_title} "
-              f"(chunk {hit.chunk_index}, score {hit.score:.3f})")
+        kind = "transcript" if hit.source_type == "transcript" else "document"
+        print(f"  [{i}] {hit.citation}  ({kind}, score {hit.score:.3f})")
 
 
 def main() -> None:
@@ -38,12 +40,21 @@ def main() -> None:
 
     question = " ".join(args)
 
+    # Scoping the search is how you ask "what did we DECIDE" separately from
+    # "what does the policy SAY" -- and how you compare the two.
+    source_type = None
+    if "--documents" in sys.argv:
+        source_type = "document"
+    elif "--transcripts" in sys.argv:
+        source_type = "transcript"
+
     if "--no-llm" in sys.argv:
-        hits = retrieve(question, top_k=DEFAULT_TOP_K, min_score=DEFAULT_MIN_SCORE)
+        hits = retrieve(question, top_k=DEFAULT_TOP_K,
+                        min_score=DEFAULT_MIN_SCORE, source_type=source_type)
         show_sources(hits)
         print()
         for i, hit in enumerate(hits, start=1):
-            print(f"--- [{i}] {hit.document_title} (score {hit.score:.3f}) ---")
+            print(f"--- [{i}] {hit.citation} (score {hit.score:.3f}) ---")
             print(hit.text)
             print()
         return
@@ -54,10 +65,11 @@ def main() -> None:
         print("  ollama pull qwen2.5:7b-instruct")
         print("\nFalling back to retrieval only:\n")
         show_sources(retrieve(question, top_k=DEFAULT_TOP_K,
-                              min_score=DEFAULT_MIN_SCORE))
+                              min_score=DEFAULT_MIN_SCORE,
+                              source_type=source_type))
         sys.exit(1)
 
-    hits, stream = answer_question_stream(question)
+    hits, stream = answer_question_stream(question, source_type=source_type)
     show_sources(hits)
     print("\nAnswer:")
     for fragment in stream:

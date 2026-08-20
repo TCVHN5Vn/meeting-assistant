@@ -17,12 +17,11 @@ is the safe default.
 import uuid
 from pathlib import Path
 
-import numpy as np
-
-from app.config import EMBEDDING_DIM, SAMPLE_DATA_DIR
+from app.config import SAMPLE_DATA_DIR
 from app.db import init_db, utc_now
-from app.rag import embeddings, loaders, store
+from app.rag import loaders
 from app.rag.chunking import chunk_text
+from app.rag.indexing import index_stats, rebuild_index
 
 DEFAULT_DOCS_DIR = SAMPLE_DATA_DIR / "documents"
 
@@ -64,7 +63,8 @@ def ingest_directory(directory: Path = DEFAULT_DOCS_DIR, force: bool = False) ->
                 # or the index ends up holding both versions and retrieval
                 # starts quoting stale policy back at people.
                 conn.execute(
-                    "DELETE FROM document_chunks WHERE document_id = ?",
+                    """DELETE FROM rag_chunks
+                       WHERE source_type = 'document' AND source_id = ?""",
                     (existing["id"],),
                 )
                 doc_id = existing["id"]
@@ -85,20 +85,21 @@ def ingest_directory(directory: Path = DEFAULT_DOCS_DIR, force: bool = False) ->
             print(f"  {path.name}: {len(text):,} chars -> {len(pieces)} chunks")
 
             for i, piece in enumerate(pieces):
-                # vector_id is left NULL here on purpose. It cannot be known
-                # until every document has been processed and we know the
-                # final ordering of the rebuilt index. It is filled in by
-                # _rebuild_index below, in one pass, at the end.
+                # start_ts/end_ts are NULL: a document has no time dimension.
+                # vector_id is NULL too, on purpose -- it cannot be known
+                # until every source has been written and the final index
+                # ordering is decided. rebuild_index fills it in at the end.
                 conn.execute(
-                    """INSERT INTO document_chunks
-                       (id, document_id, chunk_index, text, vector_id, created_at)
-                       VALUES (?, ?, ?, ?, NULL, ?)""",
-                    (str(uuid.uuid4()), doc_id, i, piece, utc_now()),
+                    """INSERT INTO rag_chunks
+                       (id, source_type, source_id, source_title, chunk_index,
+                        text, start_ts, end_ts, vector_id, created_at)
+                       VALUES (?, 'document', ?, ?, ?, ?, NULL, NULL, NULL, ?)""",
+                    (str(uuid.uuid4()), doc_id, path.stem, i, piece, utc_now()),
                 )
 
             conn.commit()
 
-        total_chunks = _rebuild_index(conn)
+        total_chunks = rebuild_index(conn)
         return {
             "documents": len(files) - skipped,
             "chunks": total_chunks,
@@ -106,61 +107,3 @@ def ingest_directory(directory: Path = DEFAULT_DOCS_DIR, force: bool = False) ->
         }
     finally:
         conn.close()
-
-
-def _rebuild_index(conn) -> int:
-    """Re-embed every chunk in the database and rebuild the FAISS index.
-
-    Assigning vector_ids here, in a single deterministic pass over an
-    ORDER BY, is what keeps the two stores consistent: position i in the
-    index and the row with vector_id = i are guaranteed to be the same
-    chunk, because both come from this one ordered list.
-    """
-    rows = conn.execute(
-        "SELECT id, text FROM document_chunks ORDER BY document_id, chunk_index"
-    ).fetchall()
-
-    if not rows:
-        print("Nothing to index.")
-        return 0
-
-    print(f"Embedding {len(rows)} chunks...")
-    vectors = embeddings.embed_texts([r["text"] for r in rows])
-
-    print(f"Building FAISS index ({vectors.shape[0]} x {EMBEDDING_DIM})...")
-    index = store.build_index(vectors)
-    store.save_index(index)
-
-    conn.executemany(
-        "UPDATE document_chunks SET vector_id = ? WHERE id = ?",
-        [(i, row["id"]) for i, row in enumerate(rows)],
-    )
-    conn.commit()
-
-    print(f"Index saved. {index.ntotal} vectors.")
-    return len(rows)
-
-
-def index_stats() -> dict:
-    """Quick health check: do SQLite and FAISS agree with each other?"""
-    conn = init_db()
-    try:
-        docs = conn.execute("SELECT COUNT(*) AS n FROM documents").fetchone()["n"]
-        chunks = conn.execute(
-            "SELECT COUNT(*) AS n FROM document_chunks WHERE vector_id IS NOT NULL"
-        ).fetchone()["n"]
-    finally:
-        conn.close()
-
-    index = store.load_index()
-    vectors = index.ntotal if index is not None else 0
-
-    return {
-        "documents": docs,
-        "indexed_chunks": chunks,
-        "vectors_in_faiss": vectors,
-        # If this is ever False the two stores have drifted and retrieval
-        # is returning text that does not correspond to the matched vector.
-        # Fix by re-running ingest with force=True.
-        "in_sync": chunks == vectors,
-    }

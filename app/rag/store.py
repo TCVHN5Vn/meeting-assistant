@@ -13,8 +13,8 @@ So the system ends up with two stores, and one join key between them:
 
     SQLite                     FAISS
     ------                     -----
-    document_chunks.text  <--  positions 0, 1, 2, ...
-    document_chunks.vector_id
+    rag_chunks.text       <--  positions 0, 1, 2, ...
+    rag_chunks.vector_id
 
 The Postgres+pgvector option in the architecture doc collapses these into
 one system, which removes the sync problem below entirely. That is the main
@@ -99,7 +99,7 @@ def search(index, query_vector: np.ndarray, top_k: int = 5):
 
     FAISS hands back two parallel arrays. `ids` are POSITIONS in the index,
     not anything meaningful on their own -- app/rag/retrieve.py is what
-    turns them back into text via the document_chunks table.
+    turns them back into text via the rag_chunks table.
 
     A vector_id of -1 means "no result in this slot", which happens when
     you ask for more neighbours than the index contains. Callers must skip

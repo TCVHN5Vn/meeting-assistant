@@ -29,7 +29,24 @@ def test_schema_creates_all_tables(conn):
         row["name"]
         for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")
     }
-    assert {"meetings", "transcript_chunks", "documents", "document_chunks"} <= tables
+    assert {"meetings", "transcript_chunks", "documents", "rag_chunks"} <= tables
+
+
+def test_deprecated_tables_are_dropped(conn):
+    """An older database carrying document_chunks must be migrated, not left.
+
+    Leaving the old table would be harmless until someone read from it by
+    mistake and got silently stale results.
+    """
+    conn.execute("CREATE TABLE IF NOT EXISTS document_chunks (id TEXT PRIMARY KEY)")
+    conn.commit()
+    db._drop_deprecated(conn)
+
+    tables = {
+        row["name"]
+        for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")
+    }
+    assert "document_chunks" not in tables
 
 
 def test_create_meeting_is_idempotent(conn):

@@ -11,6 +11,15 @@ easy to find and modify as any other logic.
 RAG_SYSTEM_PROMPT = """You are a meeting assistant. You answer questions \
 using ONLY the context provided to you.
 
+The context may contain two kinds of source:
+- Written company documents. Treat these as authoritative.
+- Meeting transcripts, produced by automatic speech recognition. These are \
+what people actually SAID, and they contain recognition errors: misheard \
+words, missing words, wrong names. Read them for meaning rather than \
+quoting them word for word, and do not treat an odd phrase as a technical \
+term. Where a transcript contradicts a document, say so rather than \
+silently picking one.
+
 Rules:
 - If the context does not contain the answer, say exactly: "I don't have \
 that in the provided documents." Do not guess, and do not use knowledge \
@@ -36,9 +45,13 @@ def build_context(hits) -> str:
     """
     blocks = []
     for i, hit in enumerate(hits, start=1):
+        kind = "meeting transcript" if hit.source_type == "transcript" else "document"
+        # Labelling the KIND of each source, not just its name, is what lets
+        # the system prompt's instruction about ASR errors actually apply --
+        # the model cannot treat transcripts differently if it cannot tell
+        # which ones they are.
         blocks.append(
-            f"[{i}] (source: {hit.document_title}, "
-            f"relevance {hit.score:.2f})\n{hit.text}"
+            f"[{i}] ({kind}: {hit.citation}, relevance {hit.score:.2f})\n{hit.text}"
         )
     return "\n\n".join(blocks)
 

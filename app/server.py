@@ -19,7 +19,7 @@ from pydantic import BaseModel
 
 from app import asr, db
 from app.llm import ollama_client
-from app.rag import ingest, qa
+from app.rag import indexing, qa, transcripts
 from app.rag.qa import DEFAULT_MIN_SCORE, DEFAULT_TOP_K
 from app.rag.retrieve import retrieve
 
@@ -177,35 +177,76 @@ class SearchRequest(BaseModel):
     query: str
     top_k: int = DEFAULT_TOP_K
     min_score: float = DEFAULT_MIN_SCORE
+    # Optional scoping: 'document' or 'transcript', and/or one meeting.
+    source_type: str | None = None
+    meeting_id: str | None = None
 
 
 class AskRequest(BaseModel):
     question: str
     top_k: int = DEFAULT_TOP_K
     min_score: float = DEFAULT_MIN_SCORE
+    source_type: str | None = None
+    meeting_id: str | None = None
 
 
 def _hit_to_dict(hit) -> dict:
     return {
         "text": hit.text,
         "score": hit.score,
-        "document_title": hit.document_title,
-        "document_path": hit.document_path,
+        "source_type": hit.source_type,
+        "source_id": hit.source_id,
+        "source_title": hit.source_title,
         "chunk_index": hit.chunk_index,
+        "start_ts": hit.start_ts,
+        "end_ts": hit.end_ts,
+        "citation": hit.citation,
     }
 
 
 @app.get("/api/v1/index/stats")
 def index_stats_endpoint():
     """Corpus size, and whether SQLite and FAISS still agree with each other."""
-    return ingest.index_stats()
+    return indexing.index_stats()
+
+
+@app.post("/api/v1/meetings/{meeting_id}/index")
+async def index_meeting_endpoint(meeting_id: str):
+    """Make one meeting's transcript searchable.
+
+    In a finished product this would be triggered automatically when the
+    meeting ends. Exposed as an endpoint so it can be re-run after tuning
+    the window size or the confidence floor.
+
+    On a worker thread because it embeds every chunk in the corpus, which
+    takes seconds and would otherwise block every other request.
+    """
+    def work() -> dict:
+        conn = db.init_db()
+        try:
+            windows = transcripts.index_meeting(conn, meeting_id)
+            indexing.rebuild_index(conn)
+            return {"meeting_id": meeting_id, "windows_indexed": windows}
+        finally:
+            conn.close()
+
+    try:
+        return await asyncio.to_thread(work)
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
 
 
 @app.post("/api/v1/search")
 def search_documents(request: SearchRequest):
     """Semantic search over the ingested documents. No LLM involved."""
     try:
-        hits = retrieve(request.query, top_k=request.top_k, min_score=request.min_score)
+        hits = retrieve(
+            request.query,
+            top_k=request.top_k,
+            min_score=request.min_score,
+            source_type=request.source_type,
+            meeting_id=request.meeting_id,
+        )
     except RuntimeError as exc:
         # No index built yet -- a 409 rather than a 500, because the server
         # is fine; the corpus just has not been ingested.
@@ -225,7 +266,8 @@ async def ask(request: AskRequest):
     """
     try:
         answer = await asyncio.to_thread(
-            qa.answer_question, request.question, request.top_k, request.min_score
+            qa.answer_question, request.question, request.top_k,
+            request.min_score, request.source_type, request.meeting_id,
         )
     except RuntimeError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc

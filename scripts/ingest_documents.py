@@ -30,8 +30,12 @@ def main() -> None:
           f"skipped {result['skipped']} unchanged.")
 
     stats = index_stats()
-    print(f"Index now holds {stats['indexed_chunks']} chunks "
-          f"from {stats['documents']} document(s).")
+    # Broken down by source: the index is shared with meeting transcripts,
+    # so a bare total would look wrong to anyone who just ingested 4 files.
+    print(f"Index now holds {stats['indexed_chunks']} chunks: "
+          f"{stats['chunks_from_documents']} from {stats['documents']} document(s), "
+          f"{stats['chunks_from_transcripts']} from "
+          f"{stats['meetings_indexed']} meeting(s).")
     if not stats["in_sync"]:
         print("WARNING: SQLite and FAISS disagree on chunk count. "
               "Re-run with --force.")

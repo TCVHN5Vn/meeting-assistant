@@ -30,8 +30,11 @@ def answer_question(
     question: str,
     top_k: int = DEFAULT_TOP_K,
     min_score: float = DEFAULT_MIN_SCORE,
+    source_type: str | None = None,
+    meeting_id: str | None = None,
 ) -> Answer:
-    hits = retrieve(question, top_k=top_k, min_score=min_score)
+    hits = retrieve(question, top_k=top_k, min_score=min_score,
+                    source_type=source_type, meeting_id=meeting_id)
 
     # Refuse BEFORE calling the model, not after. If retrieval found
     # nothing relevant there is no answer to be had, and asking the LLM
@@ -52,6 +55,8 @@ def answer_question_stream(
     question: str,
     top_k: int = DEFAULT_TOP_K,
     min_score: float = DEFAULT_MIN_SCORE,
+    source_type: str | None = None,
+    meeting_id: str | None = None,
 ) -> tuple[list[Hit], Iterator[str]]:
     """Streaming variant.
 
@@ -60,7 +65,8 @@ def answer_question_stream(
     model is still writing. Retrieval takes milliseconds; generation takes
     seconds. No reason to make the user wait for the fast part.
     """
-    hits = retrieve(question, top_k=top_k, min_score=min_score)
+    hits = retrieve(question, top_k=top_k, min_score=min_score,
+                    source_type=source_type, meeting_id=meeting_id)
 
     if not hits:
         return [], iter([prompts.NO_CONTEXT_ANSWER])

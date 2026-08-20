@@ -46,6 +46,23 @@ EMBEDDING_DIM = 384
 CHUNK_SIZE = 1000
 CHUNK_OVERLAP = 200
 
+# --- Transcript windowing ------------------------------------------------
+# ASR segments average ~50 characters -- far too small to embed one at a
+# time. They are grouped into windows before indexing. See
+# app/rag/transcripts.py for what each of these controls.
+TRANSCRIPT_WINDOW_CHARS = 1000
+TRANSCRIPT_OVERLAP_CHARS = 200
+# A window covering half an hour is not "a moment in the meeting" any more,
+# however few words were said in it.
+TRANSCRIPT_MAX_SPAN_SECONDS = 180.0
+# A pause longer than this is treated as a topic boundary -- the transcript
+# equivalent of a paragraph break.
+TRANSCRIPT_GAP_SECONDS = 3.0
+# avg_logprob floor for indexing. 0 is perfectly confident, more negative is
+# less. -1.0 drops only clearly failed transcription; raise it toward -0.7
+# for a cleaner but smaller index.
+MIN_ASR_CONFIDENCE = -1.0
+
 # --- LLM ---------------------------------------------------------------
 OLLAMA_HOST = "http://localhost:11434"
 OLLAMA_MODEL = "qwen2.5:7b-instruct"

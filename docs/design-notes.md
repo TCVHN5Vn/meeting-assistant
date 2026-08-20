@@ -259,6 +259,117 @@ one path can violate it for a week without anything failing.
 
 ---
 
+## 11. One index for documents and transcripts, not two
+
+The alternative was a second table and a second FAISS index for transcripts,
+kept parallel to the document ones. It looks tidier and it is worse.
+
+It fails on any question that needs both — "does what we agreed in the
+meeting match the written policy?" — because two indexes return two
+separately-ranked lists whose scores cannot honestly be compared. Each
+similarity is computed against a different corpus, so 0.51 in one index and
+0.51 in the other do not mean the same thing. Merging them means inventing a
+fusion rule and defending it.
+
+One index over one embedding space makes that question a single search, and
+cross-source ranking comes free. In practice a real query returns them
+interleaved — transcript 0.644, document 0.574, transcript 0.484 — which is
+only meaningful because all four numbers came out of the same space.
+
+The cost is filtering. `IndexFlat` stores nothing but vectors: no metadata,
+no `WHERE`. So "search only this meeting" has to be applied after the search,
+in SQL, which means the search can return k results that the filter then
+discards, leaving fewer than k. The mitigation is over-fetching — ask for
+8× and filter down — and it is a heuristic, not a guarantee: a filter
+matching 1% of the corpus can still starve.
+
+**That is the clearest practical argument for a real vector database**
+(Qdrant, Weaviate, pgvector) over a bare index. They push the filter into
+the search itself and return exactly k matching results. Worth being able to
+name as a limit of this design rather than pretending it away.
+
+A consequence: `rag_chunks.source_id` points into either `documents` or
+`meetings` depending on `source_type`, which SQL cannot express as a foreign
+key. The database therefore cannot stop an orphan, so `index_stats()` counts
+them instead. Losing a constraint is a real cost of the polymorphic design,
+not a detail.
+
+---
+
+## 12. Transcripts need a different chunker, not the same one
+
+The tempting shortcut is to concatenate a meeting's segments into one string
+and run the document chunker over it. That discards the two things that make
+a transcript a transcript.
+
+**Time.** Segments carry timestamps. Flatten them and a retrieved passage
+can no longer say "this was said 34 minutes in" — which is most of the value
+of citing a meeting, because it is what lets someone go and listen and judge
+for themselves. A citation nobody can follow is decoration. This is also why
+`Hit.citation` formats the two source types differently: "chunk 7 of the
+meeting" is useless to a human, `Special General Meeting @ 33:46-35:05` is
+not.
+
+**Boundaries.** Written text signals structure with blank lines and full
+stops. Speech signals it with SILENCE. A three-second pause is the spoken
+equivalent of a paragraph break and a far better cut point than a character
+count.
+
+The unit of grouping differs too. ASR segments here average about 50
+characters — roughly ten words. Embedding one per vector produces vectors
+for fragments like "Five to ten." which mean nothing on their own and match
+queries at random. 723 segments became 52 windows: a 14:1 compression, and
+the difference between an index of fragments and an index of ideas.
+
+### The subtlety: overlap belongs to arbitrary cuts only
+
+Caught by a unit test, not by reading the code.
+
+The first version applied the overlap carry-over on *every* split, including
+splits caused by a silence. That is wrong twice over. It drags the end of
+one topic into the head of the next, defeating the reason for cutting at a
+pause at all — and it stretches the new window's `start_ts` back across the
+silence, so its citation points at a moment when nobody was speaking.
+
+Overlap exists to stop a passage being severed by an *arbitrary* cut. A
+size-based cut is arbitrary and the content continues across it, so overlap
+applies. A silence is not arbitrary: it is where the speaker stopped, and
+the content genuinely changed. The two cases look identical in the code and
+need opposite treatment.
+
+---
+
+## 13. The UNIQUE constraint that only broke on the fourth document
+
+`rag_chunks.vector_id` is UNIQUE, and rebuilding reassigns every one of them.
+Updating row by row therefore collides: a row about to be given id 5 hits
+whichever row still holds 5 from the previous build.
+
+It stayed invisible through every rebuild of an unchanged corpus, because
+the ordering came out identical and each row was reassigned the value it
+already had. Adding a fourth document changed the ordering and it failed
+immediately. **A bug that only appears when the data changes shape is a bug
+that will appear in production and not in testing.**
+
+The fix is one statement: blank every `vector_id` to NULL first, then
+assign. NULL is exempt from UNIQUE in SQLite (and in the SQL standard), so
+the reassignment has a clear field.
+
+Two things worth taking from it:
+
+- The write order was also wrong, and that mattered more. The index file was
+  saved *before* the database was committed, so the failed run left 72
+  vectors in FAISS against 67 rows in SQLite. Committing the database first
+  means a later failure leaves vector_ids pointing at a missing index, which
+  `load_index` reports as a clear error. The reverse leaves a new index
+  paired with old vector_ids — which returns real text for the wrong vectors,
+  and looks like nothing worse than the model giving poor answers.
+- `index_stats()["in_sync"]` caught it, immediately and precisely. Cheap
+  consistency checks over data that two systems must agree on repay
+  themselves the first time they fire.
+
+---
+
 ## Known limitations
 
 Worth being able to name unprompted — being asked "what would you fix
@@ -279,14 +390,29 @@ first?" and having a real answer is worth more than an unbroken defence.
    batched commits and WAL mode, and SQLite's single-writer model becomes
    the ceiling that forces the Postgres migration.
 
-4. **Retrieval is over documents only, not transcripts.** The transcript
-   chunks sit in the same database, unembedded. Indexing them would enable
-   "what did we decide about the search rewrite last month?" — arguably the
-   more valuable feature, and a small extension of the existing pipeline.
+4. **Citation numbering is unreliable.** The 7B model sometimes attributes a
+   claim to the wrong `[n]` — in one observed answer it sourced a policy
+   requirement to a transcript chunk. The retrieved text was correct and the
+   claim was correct; only the number was wrong. Worth knowing because it is
+   the failure mode a reader is least likely to check. Mitigations, none of
+   them free: verify each cited claim against its chunk in a second pass,
+   constrain the output format, or use a larger model.
 
-5. **No evaluation set.** Retrieval quality is assessed by trying queries
+5. **Indexing transcripts is a manual step.** `scripts/index_transcripts.py`
+   has to be run after a meeting. In a product this would be triggered by
+   the WebSocket disconnecting. It is manual here because re-running it on
+   demand is what you need while tuning the window size or the confidence
+   floor.
+
+6. **Near-duplicate meetings are not detected.** The same audio transcribed
+   twice produces two meetings whose chunks are near-identical, and they
+   will fill the top-k with the same passage twice. Handled by hand here (one
+   of the two is simply not indexed). A real fix would deduplicate on
+   content similarity at ingest time.
+
+7. **No evaluation set.** Retrieval quality is assessed by trying queries
    and looking at the output. That is fine for development and not fine as
    a claim of quality. A labelled question→passage set with recall@k is what
    would turn tuning from guesswork into measurement.
 
-6. **No authentication.** Sprint 5. Every endpoint is currently open.
+8. **No authentication.** Sprint 5. Every endpoint is currently open.

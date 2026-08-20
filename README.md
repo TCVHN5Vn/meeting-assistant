@@ -31,31 +31,36 @@ system, rather than as a wrapper around a hosted API.
                                        │  chunk metadata │
                                        └─────────────────┘
 
-   company documents                          question
-       (.md/.txt/.pdf)                            │
-             │                                    ▼
-             ▼                          ┌──────────────────┐
-   ┌────────────────────┐               │  embed the query │
-   │ chunk → embed      │               └────────┬─────────┘
-   │ (MiniLM, 384-dim)  │                        │
-   └─────────┬──────────┘                        ▼
-             │                          ┌──────────────────┐
-             ▼                          │  FAISS: top-k    │
-   ┌────────────────────┐   ◀───────────│  nearest vectors │
-   │ FAISS index (disk) │               └────────┬─────────┘
-   └────────────────────┘                        │
-                                                 ▼
-                                       ┌───────────────────┐
-                                       │ vector_id → text  │
-                                       │ (SQLite lookup)   │
-                                       └────────┬──────────┘
-                                                ▼
-                                       ┌───────────────────┐
-                                       │ Ollama (qwen2.5)  │
-                                       │ grounded answer   │
-                                       │ + citations       │
-                                       └───────────────────┘
+   company documents         meeting transcripts          question
+    (.md/.txt/.pdf)          (from the DB above)              │
+          │                          │                        ▼
+          ▼                          ▼              ┌──────────────────┐
+   ┌─────────────┐        ┌────────────────────┐    │  embed the query │
+   │ chunk by    │        │ window by silence  │    └────────┬─────────┘
+   │ characters  │        │ + time + confidence│             │
+   └──────┬──────┘        └─────────┬──────────┘             ▼
+          │                         │               ┌──────────────────┐
+          └───────────┬─────────────┘               │  FAISS: top-k    │
+                      ▼                   ◀─────────│  nearest vectors │
+            ┌───────────────────┐                   └────────┬─────────┘
+            │  embed (MiniLM)   │                            │
+            │  ONE shared index │                            ▼
+            └───────────────────┘                  ┌───────────────────┐
+                                                   │ vector_id → text  │
+                                                   │ (SQLite lookup)   │
+                                                   └────────┬──────────┘
+                                                            ▼
+                                                   ┌───────────────────┐
+                                                   │ Ollama (qwen2.5)  │
+                                                   │ grounded answer   │
+                                                   │ + citations       │
+                                                   └───────────────────┘
 ```
+
+Documents and transcripts share **one** index, so a single question can be
+answered from both — "does what we agreed in the meeting match the written
+policy?" is one search, not two. Transcript citations carry timestamps you
+can seek to: `Special General Meeting @ 33:46-35:05`.
 
 ## Status
 
@@ -63,6 +68,7 @@ system, rather than as a wrapper around a hosted API.
 |--------|-------|-------|
 | 1 | Batch + streaming transcription, WebSocket, transcript storage | **Done** |
 | 2 | Chunking, embeddings, FAISS index, search API, grounded Q&A | **Done** |
+| 2.5 | Transcripts indexed alongside documents, in one shared index | **Done** |
 | 3 | Real-time Q&A during a live meeting | Not started |
 | 4 | Action-item extraction into structured tasks | Not started |
 | 5 | Authentication, frontend | Not started |
@@ -129,12 +135,31 @@ python -m scripts.ingest_documents                 # sample_data/documents
 python -m scripts.ingest_documents docs/ --force   # a different folder, forced
 ```
 
+### Index meeting transcripts
+
+```bash
+python -m scripts.index_transcripts --list        # what is available
+python -m scripts.index_transcripts               # everything
+python -m scripts.index_transcripts <meeting_id>  # one meeting
+```
+
+Raw ASR segments average ~50 characters — far too small to embed one at a
+time. They are grouped into windows bounded by size, by elapsed time, and by
+silence, with segments below a confidence floor dropped. A 53-minute meeting
+of 723 segments becomes 52 windows.
+
 ### Ask a question
 
 ```bash
 python -m scripts.ask "what is the deployment process?"
 python -m scripts.ask "how much annual leave do I get?" --no-llm
+python -m scripts.ask "what was decided about finances?" --transcripts
+python -m scripts.ask "what does the policy require?" --documents
 ```
+
+`--transcripts` and `--documents` scope the search, which is how you ask
+what was **said** separately from what the policy **says** — and then compare
+them.
 
 `--no-llm` prints the retrieved chunks without generating an answer. When an
 answer looks wrong, this tells you in one command whether the problem is
@@ -153,6 +178,14 @@ curl -X POST localhost:8000/api/v1/search \
 curl -X POST localhost:8000/api/v1/ask \
   -H 'content-type: application/json' \
   -d '{"question": "who approves lifting a deploy freeze?"}'
+
+# Scope to one meeting
+curl -X POST localhost:8000/api/v1/search \
+  -H 'content-type: application/json' \
+  -d '{"query": "reserves", "meeting_id": "<uuid>"}'
+
+# Make a meeting searchable
+curl -X POST localhost:8000/api/v1/meetings/<uuid>/index
 ```
 
 Interactive docs at `http://localhost:8000/docs`.
@@ -163,9 +196,14 @@ Interactive docs at `http://localhost:8000/docs`.
 pytest tests/ -q
 ```
 
-The suite covers the chunker and the database schema — the deterministic
-parts. Model behaviour is not unit-tested; that belongs in evaluation
-against a labelled question set, which is a separate discipline.
+31 tests covering the document chunker, the transcript windower, and the
+database schema — the deterministic parts. Model behaviour is not
+unit-tested; that belongs in evaluation against a labelled question set,
+which is a separate discipline.
+
+The windowing tests earned their place immediately: one of them caught that
+overlap was being applied across silence boundaries, which is exactly where
+it should not be. See §12 of the design notes.
 
 ## Layout
 
@@ -176,12 +214,14 @@ app/
   asr.py               Whisper loading and transcription
   server.py            FastAPI app: WebSocket + REST endpoints
   rag/
-    chunking.py        splitting text into overlapping windows
+    chunking.py        splitting documents into overlapping chunks
+    transcripts.py     grouping ASR segments into windows; timestamps
     embeddings.py      text → 384-dim vectors
     store.py           FAISS index: build, save, load, search
     loaders.py         reading .txt / .md / .pdf, content hashing
-    ingest.py          the full ingestion pipeline
-    retrieve.py        question → ranked chunks
+    ingest.py          document ingestion
+    indexing.py        the single shared index rebuild + consistency check
+    retrieve.py        question → ranked chunks, with source filters
     qa.py              retrieve → prompt → generate → answer + sources
   llm/
     ollama_client.py   HTTP client for the local model

@@ -21,7 +21,7 @@ from app.config import DB_PATH, ensure_dirs
 # The doc specifies Postgres with a `document_embeddings` table holding a
 # `vector(1536)` column (that is the pgvector extension). We are on
 # SQLite, which has no vector type, so the vectors live in a FAISS index
-# file instead, and `document_chunks.vector_id` is the join key between
+# file instead, and `rag_chunks.vector_id` is the join key between
 # the two. That column IS the interesting part of this schema -- read the
 # comment on it below.
 
@@ -60,35 +60,79 @@ CREATE TABLE IF NOT EXISTS documents (
     created_at    TEXT
 );
 
-CREATE TABLE IF NOT EXISTS document_chunks (
+-- ONE table for everything retrievable, whatever it came from.
+--
+-- The obvious alternative was a second table and a second FAISS index for
+-- transcripts, kept parallel to the document ones. That fails the moment
+-- a question needs both -- "does what we agreed in the meeting match the
+-- written policy?" -- because two indexes give two separately-ranked lists
+-- whose scores cannot be honestly compared: each is normalised against a
+-- different corpus. Merging them means inventing a fusion rule.
+--
+-- One index over one embedding space makes that question a single search,
+-- and the ranking is meaningful across sources for free. The cost is that
+-- "search only this meeting" is no longer a cheap index lookup -- FAISS
+-- IndexFlat carries no metadata and cannot filter. See the over-fetch
+-- strategy in app/rag/retrieve.py for how that is paid for.
+CREATE TABLE IF NOT EXISTS rag_chunks (
     id           TEXT PRIMARY KEY,
-    document_id  TEXT REFERENCES documents(id),
-    -- Position of this chunk inside its document (0, 1, 2 ...). Lets us
-    -- show a retrieved chunk in context, or stitch neighbours together.
+
+    -- 'document' or 'transcript'. Drives how the chunk is cited: a
+    -- document cites a title and position, a transcript cites a meeting
+    -- and a timestamp range you can actually seek to in the audio.
+    source_type  TEXT NOT NULL,
+    -- documents.id or meetings.id, depending on source_type. Deliberately
+    -- NOT a foreign key: it points into one of two tables, and SQL cannot
+    -- express that. The tradeoff is that the database can no longer stop
+    -- an orphan, so app/rag/indexing.py checks for them instead.
+    source_id    TEXT NOT NULL,
+    -- Copied from the parent rather than joined at read time. This is
+    -- denormalisation, done on purpose: retrieval returns chunks from two
+    -- different parent tables at once, and a query that has to branch on
+    -- source_type to know which table to join is both slower and uglier
+    -- than carrying the title along. Titles here never change in place.
+    source_title TEXT,
+
     chunk_index  INTEGER,
     text         TEXT,
+
+    -- Seconds into the meeting. NULL for documents, which have no time
+    -- dimension. This is what makes a transcript citation clickable.
+    start_ts     REAL,
+    end_ts       REAL,
+
     -- THE JOIN KEY BETWEEN SQLITE AND FAISS.
     --
     -- FAISS does not store text. It stores an array of vectors, and when
     -- you search it, it hands back integer positions -- "your nearest
     -- neighbours are vectors #4, #17, #92" -- plus distances. Those
     -- integers are meaningless on their own. This column is what turns
-    -- them back into readable text: search FAISS, get ints, look up the
-    -- rows whose vector_id matches, read their `text`.
+    -- them back into readable text.
     --
     -- Keeping these two stores in sync is the single most common source
     -- of bugs in a hand-rolled RAG system. Delete a chunk from SQLite
     -- without rebuilding the index and every vector_id after it still
-    -- points at the old position -- so your search silently returns the
-    -- wrong text. Our ingest script sidesteps this by rebuilding the
-    -- whole index from scratch; see app/rag/store.py.
+    -- points at the old position -- so search silently returns the wrong
+    -- text. We sidestep it by rebuilding the whole index from scratch;
+    -- see app/rag/indexing.py.
     vector_id    INTEGER UNIQUE,
     created_at   TEXT
 );
 
-CREATE INDEX IF NOT EXISTS idx_docchunks_vector
-    ON document_chunks(vector_id);
+CREATE INDEX IF NOT EXISTS idx_ragchunks_vector ON rag_chunks(vector_id);
+CREATE INDEX IF NOT EXISTS idx_ragchunks_source ON rag_chunks(source_type, source_id);
 """
+
+# Tables that earlier versions of this project created and no longer uses.
+# Everything in them is derived from files on disk or from transcript_chunks,
+# so dropping is safe -- nothing here is a source of truth.
+DEPRECATED_TABLES = ["document_chunks"]
+
+
+def _drop_deprecated(conn) -> None:
+    for table in DEPRECATED_TABLES:
+        conn.execute(f"DROP TABLE IF EXISTS {table}")
+    conn.commit()
 
 
 def utc_now() -> str:
@@ -123,6 +167,7 @@ def init_db() -> sqlite3.Connection:
     conn = get_connection()
     conn.executescript(SCHEMA)
     conn.commit()
+    _drop_deprecated(conn)
     return conn
 
 
