@@ -29,11 +29,26 @@ quickly and flatly, and it sits at a phrase boundary where the model has no
 surrounding words to constrain its guess. The part of the utterance you are
 keying on is the part most likely to come back wrong.
 
-So the name is matched exactly -- "assistant" is long and distinctive enough
-to survive -- while the greeting in front of it is matched against a set
-that includes the mishearings actually observed. Requiring SOME greeting is
-what keeps precision: a bare "assistant" appears in ordinary sentences
-("the assistant will circulate the notes") and would fire on them.
+The first fix made the GREETING tolerant and kept the name exact, reasoning
+that "assistant" was long and distinctive enough to survive. Real use
+disproved that too: a recogniser returned "Hey, Assessent, what's the notes
+period...". The name is no safer than the greeting.
+
+So both are matched loosely now, by different means. The greeting is checked
+against a set of observed mishearings. The name is matched by similarity,
+with one extra condition: it must share the first two letters. That is what
+separates real confusions from ordinary words --
+
+    assessent 0.67  assessment 0.63  assistance 0.84   <- all start "as"
+    insistent 0.67  consistent 0.63  resistant  0.78   <- do not
+
+-- because recognisers rarely mangle the opening of a stressed word, and the
+confusions all happen in the middle and the end. A bare similarity threshold
+cannot separate those lists; the prefix does.
+
+Precision is still carried by requiring SOME greeting. "assistant" alone
+appears in ordinary sentences ("the assistant will circulate the notes"), and
+so, occasionally, does "be consistent" -- but "hey consistent" does not.
 
 DETECTION IS A CHEAP GATE, NOT A MODEL
 
@@ -47,6 +62,7 @@ model only once the gate passes, is the general shape.
 
 import re
 from dataclasses import dataclass
+from difflib import SequenceMatcher
 
 from app.config import ASSISTANT_NAME, AUTO_ANSWER_MODE, WAKE_GREETINGS
 
@@ -64,12 +80,26 @@ _INTERROGATIVES = (
 # "hey assistant" are the same thing.
 _NORMALISE = re.compile(r"[^\w\s]")
 
-# <greeting> [meeting] assistant  -- the greeting is required, the word
-# "meeting" optional, the name exact.
+# <greeting> [meeting] <word>  -- the greeting is required and the word after
+# it is then checked for similarity to the assistant's name. The name cannot
+# go in the pattern itself precisely because it is what gets misheard.
 _WAKE_RE = re.compile(
-    r"\b(?:" + "|".join(WAKE_GREETINGS) + r")\s+(?:meeting\s+)?"
-    + re.escape(ASSISTANT_NAME) + r"\b"
+    r"\b(?:" + "|".join(WAKE_GREETINGS) + r")\s+(?:meeting\s+)?(\w+)"
 )
+
+# How close a word must be to the assistant's name to count as it, and how
+# many opening characters must match exactly. See the docstring above.
+NAME_SIMILARITY = 0.6
+NAME_PREFIX = 2
+
+
+def sounds_like_name(word: str) -> bool:
+    """Is this word the assistant's name, allowing for misrecognition?"""
+    name = ASSISTANT_NAME.lower()
+    word = word.lower()
+    if word[:NAME_PREFIX] != name[:NAME_PREFIX]:
+        return False
+    return SequenceMatcher(None, word, name).ratio() >= NAME_SIMILARITY
 
 
 @dataclass
@@ -125,8 +155,13 @@ def strip_wake_phrase(text: str) -> str | None:
     back whatever the retriever happened to consider closest to nothing.
     """
     flat = normalise(text)
-    match = _WAKE_RE.search(flat)
-    if match is None:
+
+    # There may be several greetings in one utterance; only the one followed
+    # by something name-shaped counts.
+    for match in _WAKE_RE.finditer(flat):
+        if sounds_like_name(match.group(1)):
+            break
+    else:
         return None
 
     # Map the position in the normalised string back to the original by

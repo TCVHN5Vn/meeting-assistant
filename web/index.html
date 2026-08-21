@@ -213,7 +213,9 @@
       </form>
       <div class="pane-body" id="answers">
         <p class="empty">Answers cite what they were built from. Nothing found above the
-          relevance floor means it says so rather than guessing.</p>
+          relevance floor means it says so rather than guessing.<br><br>
+          A meeting becomes searchable when you stop recording &mdash; ask about what was
+          just said only after the status reads <em>searchable</em>.</p>
       </div>
     </div>
 
@@ -473,6 +475,16 @@ function handleServerEvent(message) {
     case "qa_response":    finishAnswer(); break;
     case "qa_busy":        setAnswerNote(data.message); break;
     case "audio_ended":    $("conn-status").textContent = "audio ended"; break;
+    case "indexing_started":
+      $("conn-status").textContent = "making this meeting searchable…"; break;
+    case "indexed":
+      // Until this fires, questions about what was just said are answered
+      // from OTHER meetings, which looks like the assistant ignoring you.
+      $("conn-status").textContent = data.windows
+        ? `searchable (${data.windows} passages)` : "audio ended";
+      break;
+    case "indexing_failed":
+      $("conn-status").textContent = `indexing failed: ${data.message}`; break;
     case "qa_error":
     case "error":          setAnswerNote(data.message); break;
   }

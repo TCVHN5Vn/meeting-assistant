@@ -101,6 +101,12 @@ def render(message: str) -> None:
     elif event == "audio_ended":
         print(f"{DIM}[end of audio]{RESET}")
 
+    elif event == "indexing_started":
+        print(f"{DIM}[making this meeting searchable...]{RESET}")
+
+    elif event == "indexed":
+        print(f"{DIM}[searchable: {data['windows']} passages]{RESET}")
+
     elif event == "qa_busy":
         print(f"\n{YELLOW}[busy] {data['message']}{RESET}")
 

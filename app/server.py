@@ -396,6 +396,41 @@ class LiveSession:
         if final is not None:
             await self.handle_utterance(final, notify=notify)
 
+    async def index_this_meeting(self) -> None:
+        """Make what was just said searchable.
+
+        Until now this was a manual script, and the gap was invisible in a
+        way that made the product look broken: you record a meeting, ask
+        about something you just discussed, and the assistant answers from
+        some *other* meeting because yours was never indexed. The transcript
+        was saved the whole time -- saved and searchable are different
+        things, and nothing in the interface said which one you had.
+
+        Runs on a worker thread: it re-embeds every chunk in the corpus and
+        rewrites the index, which takes seconds and would otherwise block
+        every other connection.
+        """
+        def work() -> int:
+            conn = db.init_db()
+            try:
+                windows = transcripts.index_meeting(conn, self.meeting_id)
+                if windows:
+                    indexing.rebuild_index(conn)
+                return windows
+            finally:
+                conn.close()
+
+        await self.send("indexing_started")
+        try:
+            windows = await asyncio.to_thread(work)
+        except Exception as exc:  # noqa: BLE001 - never kill the session for this
+            print(f"[{self.meeting_id}] indexing failed: {exc!r}")
+            await self.send("indexing_failed", message=str(exc))
+            return
+
+        print(f"[{self.meeting_id}] indexed {windows} window(s)")
+        await self.send("indexed", windows=windows)
+
     async def _note_question(self, question: str, trigger: str) -> None:
         """A question whose utterance was cut mid-sentence. Wait for the rest.
 
@@ -447,6 +482,7 @@ class LiveSession:
             # exactly the case where the buffer holds the most.
             await self.flush_audio()
             await self.send("audio_ended")
+            await self.index_this_meeting()
         elif event == "ask_query":
             question = (message.get("data") or {}).get("text", "").strip()
             if not question:
@@ -661,6 +697,8 @@ async def ws_meeting(websocket: WebSocket, meeting_id: str):
         server -> client  qa_delta           answer fragments, as generated
         server -> client  qa_response        the complete answer
         server -> client  audio_ended        the buffer has been flushed
+    server -> client  indexing_started   making this meeting searchable
+    server -> client  indexed            it is now searchable
     server -> client  qa_busy / qa_error / error
     """
     await websocket.accept()

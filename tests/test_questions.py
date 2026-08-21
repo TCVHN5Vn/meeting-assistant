@@ -39,6 +39,36 @@ def test_misrecognised_greeting_still_matches():
         == "what is the notice period?"
 
 
+def test_misrecognised_NAME_still_matches():
+    """The second half of the same lesson, found in real use.
+
+    The first fix made the greeting tolerant and kept the name exact,
+    reasoning that "assistant" was long enough to survive. A real recording
+    returned "Hey, Assessent, what's the notes period..." -- the name is no
+    safer than the greeting.
+    """
+    assert strip_wake_phrase("Hey, Assessent, what's the notes period?") \
+        == "what's the notes period?"
+    assert strip_wake_phrase("hey assistance what did we decide") \
+        == "what did we decide"
+    assert strip_wake_phrase("hi assistent can you summarise") \
+        == "can you summarise"
+
+
+def test_similar_words_after_a_greeting_do_not_fire():
+    """A bare similarity score cannot separate these from real mishearings.
+
+        assessent 0.67   insistent 0.67   consistent 0.63
+
+    Requiring the first two letters to match is what does it: recognisers
+    rarely mangle the opening of a stressed word, and these confusions all
+    happen in the middle and the end.
+    """
+    assert strip_wake_phrase("hey everyone, please be consistent about this") is None
+    assert strip_wake_phrase("hi, what is the attendance for tonight") is None
+    assert strip_wake_phrase("ok, the president will open the meeting") is None
+
+
 def test_wake_phrase_mid_utterance():
     """Chunks rarely start neatly at the wake phrase."""
     text = "So, um, what the policy says about this. Hey assistant, what changed?"
