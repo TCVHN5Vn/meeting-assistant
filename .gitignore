@@ -30,6 +30,11 @@ docs/PROJECT-GUIDE.md
 
 # --- Secrets ---
 .env
+# Anything named *.local.* is for this machine only and never committed.
+# Two rules on purpose: the pattern catches files added later, the explicit
+# path survives someone rewriting the pattern.
+*.local.*
+CREDENTIALS.local.md
 
 # --- macOS ---
 .DS_Store
