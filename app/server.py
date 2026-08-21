@@ -172,7 +172,15 @@ def index():
     across many components starts being the hard part. It is not, yet, and
     adding it now would be resume-driven rather than reasoned.
     """
-    return FileResponse(WEB_DIR / "index.html")
+    # no-store, because the browser caching this file is a genuinely
+    # confusing failure: the server gains a feature, the page keeps running
+    # yesterday's JavaScript, and the symptom is "the new thing does not
+    # work" with nothing in any log to explain it. One HTML file is cheap
+    # to re-fetch; a debugging session caused by a stale one is not.
+    return FileResponse(
+        WEB_DIR / "index.html",
+        headers={"Cache-Control": "no-store, must-revalidate"},
+    )
 
 
 @app.get("/health")

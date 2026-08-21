@@ -12,9 +12,57 @@ POSITIONS in a single shared index -- they only make sense assigned all at
 once, from one ordered list.
 """
 
-from app.config import EMBEDDING_DIM
+import numpy as np
+
+from app.config import DUPLICATE_SIMILARITY, EMBEDDING_DIM
 from app.db import init_db
 from app.rag import embeddings, store
+
+
+def find_duplicates(vectors, lengths) -> set[int]:
+    """Positions whose content already appears earlier in the corpus.
+
+    WHY THIS IS NEEDED AT ALL
+
+    Meetings index themselves when recording stops, which is right for a
+    product and turned out to poison the index during development. Every
+    test recording of "Hey assistant, what is the notice period?" became a
+    passage -- and a recorded question is the *nearest possible neighbour*
+    to that same question asked later. Six test runs put six echoes of the
+    question above the document that actually answers it, and the answer
+    degraded to "the policy should be checked".
+
+    Retrieval returns the top k. Anything that occupies a slot without
+    adding information is actively harmful, and a near-duplicate is exactly
+    that: it displaces a different passage that would have added something.
+
+    Comparison is on the VECTORS, not the text. The recordings differ --
+    "notice period" against "notes period", "assistant" against "Assessent"
+    -- so string comparison would have missed them, while the embeddings
+    put them at 0.95 of each other.
+
+    The longest version of a repeated passage is the one kept: it is the
+    most complete take, and length is a reasonable proxy for that when the
+    alternative is choosing arbitrarily.
+    """
+    if len(vectors) < 2:
+        return set()
+
+    # Vectors are already normalised, so a dot product IS cosine similarity
+    # and the whole comparison is one matrix multiply.
+    similarity = vectors @ vectors.T
+
+    # Longest first, so the fullest take is the one that survives.
+    order = sorted(range(len(vectors)), key=lambda i: -lengths[i])
+
+    kept: list[int] = []
+    duplicates: set[int] = set()
+    for i in order:
+        if any(similarity[i][j] >= DUPLICATE_SIMILARITY for j in kept):
+            duplicates.add(i)
+        else:
+            kept.append(i)
+    return duplicates
 
 
 def rebuild_index(conn) -> int:
@@ -45,9 +93,20 @@ def rebuild_index(conn) -> int:
     print(f"Embedding {len(rows)} chunks...")
     vectors = embeddings.embed_texts([r["text"] for r in rows])
 
+    duplicates = find_duplicates(vectors, [len(r["text"]) for r in rows])
+    if duplicates:
+        print(f"Skipping {len(duplicates)} near-duplicate chunk(s).")
+    keep = [i for i in range(len(rows)) if i not in duplicates]
+    rows = [rows[i] for i in keep]
+    vectors = vectors[keep]
+
     print(f"Building FAISS index ({vectors.shape[0]} x {EMBEDDING_DIM})...")
     index = store.build_index(vectors)
 
+    # Clearing every vector_id first also un-indexes anything dropped as a
+    # duplicate above: it keeps its row and its text, and simply stops being
+    # a search result.
+    #
     # Clear every vector_id BEFORE assigning the new ones.
     #
     # vector_id is UNIQUE, and reassignment shuffles the values around: a row

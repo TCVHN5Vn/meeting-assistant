@@ -66,6 +66,15 @@ VAD_TAIL_MS = 200
 EMBEDDING_MODEL_NAME = "sentence-transformers/all-MiniLM-L6-v2"
 EMBEDDING_DIM = 384
 
+# --- Near-duplicate suppression ------------------------------------------
+# Two passages whose vectors are at least this similar are treated as the
+# same content, and only one is indexed. See dedupe in app/rag/indexing.py.
+# Measured on this corpus rather than guessed: repeated recordings of one
+# sentence sit at 0.73-0.88 of each other, while genuinely different passages
+# on the same topic sit around 0.33. An earlier value of 0.92 was picked by
+# intuition and caught almost none of them.
+DUPLICATE_SIMILARITY = 0.85
+
 # --- Chunking ----------------------------------------------------------
 # Measured in characters, not tokens -- simpler, and precise enough at
 # this scale. See app/rag/chunking.py for why these numbers.
