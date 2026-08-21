@@ -114,3 +114,48 @@ About six thousand lines of Python and over a hundred and twenty tests — and
 the interesting parts weren't the AI calls. They were the boundaries around
 them: deciding where to cut the audio, when to refuse to answer, and how to
 verify what the model hands back.
+
+---
+
+# Short version (~90 seconds)
+
+Keeps the four beats that matter: it hears you, it answers from your own
+material, it refuses when it should, and it checks its own work.
+
+---
+
+This is a meeting assistant. It listens, answers questions while the meeting
+is still running, and pulls out the action items — and all of it runs on
+this laptop. No API key, and nothing leaves the machine.
+
+*(start recording)*
+
+So the next item is the notice period for general meetings.
+
+Hey assistant — what is the notice period for a general meeting?
+
+*(pause)*
+
+I didn't touch the keyboard. It heard its name, searched our documents, and
+it's answering now — while transcription keeps running underneath. Fourteen
+to sixty days, and it cites the policy it took that from.
+
+Now the part I care about more.
+
+*(type: what is our stock price?)*
+
+Nothing, and it says so. That's not modesty — nothing scored above the
+relevance threshold, so the model was never called at all. It can't invent
+an answer it was never asked to write.
+
+One more thing before I stop. We agreed that Karen will circulate the budget
+before Friday.
+
+*(pause, stop recording, open Action items, click Extract)*
+
+There — Karen, circulate the budget, before Friday. And underneath, the
+exact sentence I said. Every task has to quote the transcript, and the code
+checks that quote is really there before storing it. A model that invents a
+task has to invent the quote too.
+
+Speech in, grounded answers out, and nothing kept that can't be checked.
