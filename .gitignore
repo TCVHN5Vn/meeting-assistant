@@ -23,6 +23,11 @@ sample_data/audio/
 *.mp3
 *.wav
 
+# --- Kept local, deliberately ---
+# A long-form explanation of the project, useful on this machine and not
+# something to publish. Untracked rather than deleted.
+docs/PROJECT-GUIDE.md
+
 # --- Secrets ---
 .env
 
