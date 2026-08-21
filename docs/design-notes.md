@@ -463,12 +463,27 @@ flatly, and sits at a phrase boundary where the recogniser has no
 surrounding words to constrain its guess. *The part of the utterance you are
 keying on is the part most likely to come back wrong.*
 
-So the name is matched exactly — "assistant" is long and distinctive enough
-to survive — while the greeting in front of it is matched against a set that
-includes the mishearings actually observed (`he`, `hay`, `hei`). Requiring
-*some* greeting is what preserves precision: bare "assistant" occurs in
-ordinary sentences ("the assistant will circulate the notes") and would fire
-on them.
+The first fix made the greeting tolerant and kept the name exact, reasoning
+that "assistant" was long and distinctive enough to survive. **Real use
+disproved that too**: a recogniser returned "Hey, Assessent, what's the notes
+period...". The name is no safer than the greeting.
+
+Both are loose now, by different means. The greeting is checked against a set
+of observed mishearings. The name is matched by similarity, with one extra
+condition — it must share the first two letters:
+
+```
+assessent 0.67   assessment 0.63   assistance 0.84    <- all start "as"
+insistent 0.67   consistent 0.63   resistant  0.78    <- do not
+```
+
+A bare similarity threshold cannot separate those two lists. The prefix can,
+because recognisers rarely mangle the *opening* of a stressed word and these
+confusions all happen in the middle and the end.
+
+Precision is still carried by requiring *some* greeting: bare "assistant"
+occurs in ordinary sentences ("the assistant will circulate the notes"), and
+so does "be consistent" — but "hey consistent" does not.
 
 ---
 
@@ -991,17 +1006,17 @@ first?" and having a real answer is worth more than an unbroken defence.
    50-minute meeting, and it holds the HTTP request open. A production
    version would return 202 and a job id.
 
-9. **Indexing transcripts is a manual step.** `scripts/index_transcripts.py`
-   has to be run after a meeting. In a product this would be triggered by
-   the WebSocket disconnecting. It is manual here because re-running it on
-   demand is what you need while tuning the window size or the confidence
-   floor.
+9. **Re-indexing rebuilds the whole corpus.** A meeting indexes itself when
+   recording stops, but that rebuilds every vector rather than adding the
+   new ones. It costs seconds at this size and would not scale; the fix is
+   an index that supports stable ids and incremental adds.
 
-10. **Near-duplicate meetings are not detected.** The same audio transcribed
-   twice produces two meetings whose chunks are near-identical, and they
-   will fill the top-k with the same passage twice. Handled by hand here (one
-   of the two is simply not indexed). A real fix would deduplicate on
-   content similarity at ingest time.
+10. **Duplicate suppression is a single threshold.** Passages whose vectors
+   exceed 0.85 similarity are dropped at index time, which handles the same
+   audio transcribed twice, and repeated test recordings. It has no notion
+   of a passage that is a *question* rather than content -- and a recorded
+   question is the nearest possible neighbour to that same question asked
+   later, which makes those the worst-behaved thing in the index.
 
 11. **No evaluation set.** Retrieval quality is assessed by trying queries
    and looking at the output. That is fine for development and not fine as

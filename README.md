@@ -251,6 +251,13 @@ python -m scripts.ingest_documents docs/ --force   # a different folder, forced
 
 ### Index meeting transcripts
 
+**A meeting recorded through the UI indexes itself when you press Stop** —
+the status line reads `searchable (N passages)` when it is done. Until then
+the transcript is saved but not findable, which are different things.
+
+These commands are for re-indexing after changing the window size or the
+confidence floor, and for meetings transcribed from a file:
+
 ```bash
 python -m scripts.index_transcripts --list        # what is available
 python -m scripts.index_transcripts               # everything
