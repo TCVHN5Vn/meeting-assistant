@@ -414,3 +414,7 @@ data/                  database + FAISS index (gitignored, regenerable)
 |---|---|
 | [docs/DEMO-SCRIPT.md](docs/DEMO-SCRIPT.md) | A four-minute walkthrough for recording a demo: what to say, what to click, what will happen, and what to do if something misbehaves on camera. Every question in it is checked against the index. |
 | [docs/design-notes.md](docs/design-notes.md) | Twenty-one design decisions, each with the alternative that was rejected and what it would have cost. Reference, not narrative. |
+
+## License
+
+MIT — see [LICENSE](LICENSE).
