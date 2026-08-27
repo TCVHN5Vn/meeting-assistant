@@ -6,6 +6,8 @@ through here, so there is one place that decides how the model is loaded
 and what a "segment" looks like.
 """
 
+import threading
+
 from dataclasses import dataclass
 from typing import Iterator
 
@@ -18,20 +20,29 @@ from app.config import WHISPER_COMPUTE_TYPE, WHISPER_DEVICE, WHISPER_MODEL_SIZE
 # dominate the runtime. Loading it once and reusing it is the whole reason
 # the streaming version is a long-lived server rather than a script.
 _model: WhisperModel | None = None
+_model_lock = threading.Lock()
 
 
 def get_model() -> WhisperModel:
     """Load the model on first use, then hand back the same instance."""
     global _model
-    if _model is None:
-        print(f"Loading Whisper '{WHISPER_MODEL_SIZE}' "
-              f"({WHISPER_DEVICE}, {WHISPER_COMPUTE_TYPE})...")
-        _model = WhisperModel(
-            WHISPER_MODEL_SIZE,
-            device=WHISPER_DEVICE,
-            compute_type=WHISPER_COMPUTE_TYPE,
-        )
-        print("Whisper ready.")
+    # Double-checked locking. Everything that loads a model now runs on a
+    # worker thread, and with several participants two threads can reach
+    # this at the same moment -- which loads Whisper twice, wastes the
+    # memory, and in practice crashed the process. The cheap check outside
+    # the lock keeps the common path (already loaded) free of contention.
+    if _model is not None:
+        return _model
+    with _model_lock:
+        if _model is None:
+            print(f"Loading Whisper '{WHISPER_MODEL_SIZE}' "
+                  f"({WHISPER_DEVICE}, {WHISPER_COMPUTE_TYPE})...")
+            _model = WhisperModel(
+                WHISPER_MODEL_SIZE,
+                device=WHISPER_DEVICE,
+                compute_type=WHISPER_COMPUTE_TYPE,
+            )
+            print("Whisper ready.")
     return _model
 
 

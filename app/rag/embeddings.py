@@ -1,3 +1,5 @@
+import threading
+
 """
 Turning text into vectors.
 
@@ -22,22 +24,31 @@ import numpy as np
 from app.config import EMBEDDING_DIM, EMBEDDING_MODEL_NAME
 
 _model = None
+_model_lock = threading.Lock()
 
 
 def get_model():
     """Load the embedding model once and reuse it (same reason as Whisper)."""
     global _model
-    if _model is None:
-        # Imported lazily rather than at module top-level: sentence-
-        # transformers pulls in torch, which takes seconds to import. No
-        # reason to pay that just because something imported this module
-        # to read a constant.
-        from sentence_transformers import SentenceTransformer
+    # Double-checked locking. Everything that loads a model now runs on a
+    # worker thread, and with several participants two threads can reach
+    # this at the same moment -- which loads embedding twice, wastes the
+    # memory, and in practice crashed the process. The cheap check outside
+    # the lock keeps the common path (already loaded) free of contention.
+    if _model is not None:
+        return _model
+    with _model_lock:
+        if _model is None:
+            # Imported lazily rather than at module top-level: sentence-
+            # transformers pulls in torch, which takes seconds to import. No
+            # reason to pay that just because something imported this module
+            # to read a constant.
+            from sentence_transformers import SentenceTransformer
 
-        print(f"Loading embedding model '{EMBEDDING_MODEL_NAME}' "
-              f"(first run downloads ~90MB, then cached)...")
-        _model = SentenceTransformer(EMBEDDING_MODEL_NAME)
-        print("Embedding model ready.")
+            print(f"Loading embedding model '{EMBEDDING_MODEL_NAME}' "
+                  f"(first run downloads ~90MB, then cached)...")
+            _model = SentenceTransformer(EMBEDDING_MODEL_NAME)
+            print("Embedding model ready.")
     return _model
 
 

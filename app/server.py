@@ -13,6 +13,7 @@ event list.
 import asyncio
 import json
 import uuid
+from datetime import datetime, timezone
 from contextlib import asynccontextmanager
 
 from fastapi import Depends, FastAPI, HTTPException, WebSocket, WebSocketDisconnect
@@ -253,6 +254,41 @@ async def aiter_blocking(make_iterator):
             worker.cancel()
 
 
+# meeting_id -> the sessions currently connected to it.
+#
+# A meeting is a room, so the server needs to know who is in it. Held in
+# memory rather than the database because it describes live connections,
+# which do not survive a restart and should not look as though they did.
+#
+# The consequence worth naming: this makes the server single-process. Run
+# two workers and each has half the room, so participants stop seeing each
+# other. Fixing that means a shared broker (Redis pub/sub is the usual
+# answer), which is a real cost and not worth paying at this size.
+ROOMS: dict[str, set["LiveSession"]] = {}
+
+# Rebuilding the search index rewrites one file and reassigns every
+# vector_id, so exactly one may run at a time. With several participants in
+# a meeting they all send end_audio within moments of each other, and each
+# one asks for a rebuild -- which without this ran concurrently, wrote the
+# same index file from two threads, and killed the process.
+INDEX_LOCK = asyncio.Lock()
+
+
+async def broadcast(meeting_id: str, event: str, exclude=None, **data) -> None:
+    """Send an event to everyone in the meeting.
+
+    Sends are gathered rather than awaited in a loop: one participant on a
+    slow connection would otherwise delay delivery to everybody else.
+    return_exceptions=True because a socket that died between the lookup and
+    the send must not stop the others receiving it.
+    """
+    sessions = [s for s in ROOMS.get(meeting_id, ()) if s is not exclude]
+    if sessions:
+        await asyncio.gather(
+            *(s.send(event, **data) for s in sessions), return_exceptions=True
+        )
+
+
 class LiveSession:
     """One WebSocket connection: one meeting, in progress.
 
@@ -261,10 +297,22 @@ class LiveSession:
     single in-flight answer task.
     """
 
-    def __init__(self, websocket: WebSocket, conn, meeting_id: str):
+    def __init__(self, websocket: WebSocket, conn, meeting_id: str, user):
         self.ws = websocket
         self.conn = conn
         self.meeting_id = meeting_id
+
+        # WHO is speaking, taken from the authenticated connection rather
+        # than inferred from the audio. Exact, where acoustic diarization is
+        # a guess -- and it comes free, because the connection had to prove
+        # who it was to get here at all.
+        self.user = user
+        self.speaker_id = user["id"]
+        self.speaker_name = user["name"] or user["email"]
+
+        # Seconds between the meeting starting and this participant's first
+        # word. Set on the first audio frame; see _ensure_on_the_clock.
+        self.joined_offset: float | None = None
 
         # Accumulates the incoming stream and cuts it at pauses rather than
         # on a stopwatch. It also owns the meeting clock: every utterance
@@ -308,6 +356,8 @@ class LiveSession:
         # int16 -> float32 in [-1, 1], which is what both the VAD and Whisper
         # expect. Dividing by 32768 rather than 32767 keeps the scaling
         # exact for the most negative sample.
+        await self._ensure_on_the_clock()
+
         pcm = np.frombuffer(frame, dtype=np.int16).astype(np.float32) / 32768.0
 
         # Runs on the event loop rather than a worker thread, and that is a
@@ -322,6 +372,46 @@ class LiveSession:
         # milliseconds per call.
         for utterance in self.buffer.add(pcm):
             await self.handle_utterance(utterance)
+
+    async def _ensure_on_the_clock(self) -> None:
+        """Work out where this participant sits on the meeting's timeline.
+
+        Runs once, on the first audio frame.
+
+        Every connection measures time by counting the audio samples it has
+        received. That is exact and cannot drift, and it starts at zero when
+        THAT connection starts sending. So a participant joining three
+        minutes late also starts at zero, and merging the two transcripts
+        without correction interleaves them completely wrongly.
+
+        The first participant to speak defines the meeting's origin.
+        Everyone else records how far after it they arrived, and adds that
+        to every timestamp from then on.
+
+        All of it is measured with the server's clock. Client clocks are
+        never consulted, so a participant whose laptop is set wrong -- or
+        who changes it mid-meeting -- cannot move anyone's transcript.
+        """
+        if self.joined_offset is not None:
+            return
+
+        now = datetime.now(timezone.utc)
+        started = db.start_meeting_clock(self.conn, self.meeting_id, now.isoformat())
+        origin = datetime.fromisoformat(started)
+
+        # max(0.0, ...) guards the one case that would otherwise produce
+        # negative timestamps: two participants speaking in the same instant,
+        # where one reads the origin the other has just written.
+        self.joined_offset = max(0.0, (now - origin).total_seconds())
+
+        db.add_participant(self.conn, self.meeting_id, self.speaker_id,
+                           self.joined_offset)
+        print(f"[{self.meeting_id}] {self.speaker_name} joined the timeline "
+              f"at +{self.joined_offset:.1f}s")
+
+        await broadcast(self.meeting_id, "participant_speaking",
+                        user_id=self.speaker_id, name=self.speaker_name,
+                        joined_offset=self.joined_offset)
 
     async def handle_utterance(self, utterance, notify: bool = True) -> None:
         """Transcribe one utterance, store it, and optionally send it out.
@@ -345,8 +435,13 @@ class LiveSession:
             # Whisper timestamps each piece of audio it is given from zero,
             # so segment times are relative to this utterance. The utterance
             # knows where it sits in the meeting.
-            start_ts = utterance.start + segment.start
-            end_ts = utterance.start + segment.end
+            # Three clocks stacked, and each one has to be here. Whisper
+            # timestamps each utterance from zero; the utterance knows where
+            # it sits in this connection's audio; the offset puts this
+            # connection on the meeting's shared timeline.
+            offset = self.joined_offset or 0.0
+            start_ts = offset + utterance.start + segment.start
+            end_ts = offset + utterance.start + segment.end
 
             db.insert_transcript_chunk(
                 self.conn,
@@ -356,14 +451,19 @@ class LiveSession:
                 start_ts=start_ts,
                 end_ts=end_ts,
                 confidence=segment.confidence,
+                speaker_id=self.speaker_id,
             )
             if notify:
-                await self.send(
-                    "transcript_chunk",
+                # To the whole room, not just the speaker. Everyone sees one
+                # transcript, and every line says who said it.
+                await broadcast(
+                    self.meeting_id, "transcript_chunk",
                     text=segment.text,
                     start_ts=start_ts,
                     end_ts=end_ts,
                     confidence=segment.confidence,
+                    speaker_id=self.speaker_id,
+                    speaker_name=self.speaker_name,
                 )
 
         if not notify:
@@ -430,7 +530,13 @@ class LiveSession:
 
         await self.send("indexing_started")
         try:
-            windows = await asyncio.to_thread(work)
+            # Serialised, and deliberately not skipped when another
+            # participant has just done it: their rebuild may have run
+            # before this participant's last utterance was written. The work
+            # is idempotent, so doing it twice costs seconds and losing it
+            # once costs the end of the meeting.
+            async with INDEX_LOCK:
+                windows = await asyncio.to_thread(work)
         except Exception as exc:  # noqa: BLE001 - never kill the session for this
             print(f"[{self.meeting_id}] indexing failed: {exc!r}")
             await self.send("indexing_failed", message=str(exc))
@@ -564,10 +670,11 @@ class LiveSession:
         # Sources go out BEFORE the first token. Retrieval takes milliseconds
         # and generation takes seconds, so the client can show what is being
         # read from while the model is still writing.
-        await self.send(
-            "qa_started",
+        await broadcast(
+            self.meeting_id, "qa_started",
             question=question,
             trigger=trigger,
+            asked_by=self.speaker_name,
             sources=[_hit_to_dict(h) for h in hits],
             live_context_chars=len(recent),
         )
@@ -576,7 +683,7 @@ class LiveSession:
         try:
             async for fragment in aiter_blocking(lambda: stream):
                 pieces.append(fragment)
-                await self.send("qa_delta", text=fragment)
+                await broadcast(self.meeting_id, "qa_delta", text=fragment)
         except ollama_client.OllamaError as exc:
             await self.send("qa_error", question=question, message=str(exc))
             return
@@ -584,11 +691,12 @@ class LiveSession:
         # The complete event named in the architecture doc. Sent at the end
         # with the whole answer, so a client that ignores the deltas entirely
         # still gets a correct result from this one event.
-        await self.send(
-            "qa_response",
+        await broadcast(
+            self.meeting_id, "qa_response",
             question=question,
             text="".join(pieces),
             trigger=trigger,
+            asked_by=self.speaker_name,
             sources=[_hit_to_dict(h) for h in hits],
         )
 
@@ -717,27 +825,36 @@ async def ws_meeting(websocket: WebSocket, meeting_id: str):
 
     conn = db.init_db()
 
-    # An existing meeting belonging to someone else is refused. A new one is
-    # created owned by this user. Note the order: nothing is written to the
-    # database until the caller has been authenticated AND authorized.
-    existing = conn.execute(
-        "SELECT created_by FROM meetings WHERE id = ?", (meeting_id,)).fetchone()
-    if existing is not None and not db.user_can_access_meeting(
-            conn, user["id"], meeting_id):
-        conn.close()
-        await websocket.close(code=1008, reason="meeting not found")
-        return
-
+    # A meeting is a room. Any signed-in user holding the id may join it,
+    # and joining is what makes them a participant -- which is in turn what
+    # lets them read the transcript back later.
+    #
+    # This is a deliberate loosening of the previous rule, where an existing
+    # meeting belonging to anyone else was refused outright. Sharing a
+    # meeting id is now how you invite someone, exactly as a Zoom or Teams
+    # link works. The id is a 128-bit UUID, so holding one is not something
+    # that happens by accident -- but it IS the whole of the access control,
+    # and that is the trade being made.
     db.create_meeting(conn, meeting_id, title="Live Meeting",
                       created_by=user["id"])
-    print(f"[{meeting_id}] client connected as {user['email']}")
+
+    session = LiveSession(websocket, conn, meeting_id, user)
+    ROOMS.setdefault(meeting_id, set()).add(session)
+
+    others = [s.speaker_name for s in ROOMS[meeting_id] if s is not session]
+    print(f"[{meeting_id}] {user['email']} joined "
+          f"({len(ROOMS[meeting_id])} in the room)")
 
     await websocket.send_json({
         "event": "authenticated",
-        "data": {"user": user["email"], "meeting_id": meeting_id},
+        "data": {"user": user["email"], "name": session.speaker_name,
+                 "meeting_id": meeting_id, "others": others},
     })
 
-    session = LiveSession(websocket, conn, meeting_id)
+    # Tell the room, but not the person who just arrived -- they were told
+    # by the event above, and hearing about their own arrival reads oddly.
+    await broadcast(meeting_id, "participant_joined", exclude=session,
+                    user_id=session.speaker_id, name=session.speaker_name)
 
     try:
         while True:
@@ -755,8 +872,15 @@ async def ws_meeting(websocket: WebSocket, meeting_id: str):
                 await session.handle_text(text)
 
     except WebSocketDisconnect:
-        print(f"[{meeting_id}] client disconnected")
+        print(f"[{meeting_id}] {user['email']} left")
     finally:
+        # Leave the room BEFORE closing, so nothing tries to broadcast to a
+        # socket that is on its way out.
+        ROOMS.get(meeting_id, set()).discard(session)
+        if not ROOMS.get(meeting_id):
+            ROOMS.pop(meeting_id, None)
+        await broadcast(meeting_id, "participant_left",
+                        user_id=session.speaker_id, name=session.speaker_name)
         await session.close()
 
 
@@ -791,8 +915,11 @@ def get_transcript(meeting_id: str, user=Depends(current_user)):
         if meeting is None:
             raise HTTPException(status_code=404, detail="meeting not found")
 
-        chunks = db.get_transcript(conn, meeting_id)
-        return {"meeting": dict(meeting), "chunks": [dict(c) for c in chunks]}
+        return {
+            "meeting": dict(meeting),
+            "participants": [dict(p) for p in db.get_participants(conn, meeting_id)],
+            "chunks": [dict(c) for c in db.get_transcript_with_speakers(conn, meeting_id)],
+        }
     finally:
         conn.close()
 
@@ -820,6 +947,22 @@ class AskRequest(BaseModel):
     min_score: float = DEFAULT_MIN_SCORE
     source_type: str | None = None
     meeting_id: str | None = None
+
+
+@app.get("/api/v1/meetings/{meeting_id}/participants")
+def list_participants(meeting_id: str, user=Depends(current_user)):
+    """Who took part, and where each of them joined the timeline."""
+    require_meeting_access(meeting_id, user)
+    conn = db.init_db()
+    try:
+        return {
+            "meeting_id": meeting_id,
+            "participants": [dict(p) for p in db.get_participants(conn, meeting_id)],
+            # Who is connected right now, which the database cannot know.
+            "connected": sorted(s.speaker_name for s in ROOMS.get(meeting_id, ())),
+        }
+    finally:
+        conn.close()
 
 
 @app.get("/api/v1/index/stats")

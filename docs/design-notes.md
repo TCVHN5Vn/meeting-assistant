@@ -960,6 +960,104 @@ difference between those two is worth ten minutes of measurement every time.
 
 ---
 
+## 22. Speakers are identified by their login, not by their voice
+
+`speaker_id` had been in the schema since the first commit and was always
+NULL. The obvious way to fill it is acoustic diarization -- run pyannote
+over the audio and have it cluster the voices. This does something else.
+
+**A meeting is a room. Each participant joins it over their own
+authenticated connection, so identity comes from the connection the audio
+arrived on rather than from guessing at the sound.** It is how Teams, Zoom
+and Read.ai actually do it, and it is worth being clear about why.
+
+| | acoustic (pyannote) | per-connection (this) |
+|---|---|---|
+| accuracy | inferred; errors on far-field and overlap | **exact** |
+| dependencies | pyannote, HF token, a model | none |
+| cost per meeting | a slow ML pass over all audio | free |
+| names | `SPEAKER_00`, mapped by hand | **real names immediately** |
+
+It also costs nothing to build, because the authentication was already
+there. A connection had to prove who it was to send audio at all; that
+proof simply becomes the speaker.
+
+### The limitation, stated plainly
+
+**Two people in one room with two laptops are both transcribed saying the
+same words.** Each microphone hears both voices, so the sentence is
+recognised twice and attributed to two people.
+
+Teams and Zoom mostly avoid this because participants are remote, with
+headsets and echo cancellation. So this approach solves **remote meetings**
+exactly and **does not address the shared-room case at all** -- which is
+precisely what the recording in this repository is.
+
+That is not an argument against it. It is why real products do both:
+per-connection identity for remote participants, acoustic diarization for a
+single device in a room. This is the half that covers more meetings, and
+knowing which half you have built is the point.
+
+### The hard part was time, not identity
+
+Every connection measures time by counting the audio samples it has
+received. That is exact and cannot drift -- it is what fixed the timestamp
+bug in §10 -- and it starts at zero **when that connection starts sending**.
+
+So a participant joining three minutes late also starts at zero. Merge two
+such transcripts without correcting for it and the result is confidently,
+silently in the wrong order: the second speaker's opening remarks appear to
+interrupt the first speaker's opening remarks.
+
+The meeting therefore needs its own timeline. The first participant to speak
+sets `meetings.started_at`; everyone else records how far after it they
+arrived, and adds that offset to every timestamp thereafter.
+
+Three details decide whether this works:
+
+- **The clock starts on the first audio, not the first connection.**
+  Someone can open the page and sit there for a minute before speaking, and
+  starting the clock then would put a minute of silence at the front of the
+  meeting.
+- **`COALESCE`, not read-then-write.** Two participants whose first words
+  land in the same instant would otherwise both set the origin, and the
+  later write would move everything already recorded.
+- **Only the server's clock is ever consulted.** A participant whose laptop
+  is set wrong -- or who changes it mid-meeting -- cannot move anyone's
+  transcript, because no client timestamp is trusted anywhere.
+
+### Two concurrency bugs that only exist with more than one participant
+
+Both were invisible with a single connection and appeared on the first
+two-participant run.
+
+**Model loading raced.** Everything that loads a model now runs on a worker
+thread, and with two participants ending at the same moment, two threads
+reached `get_model()` together and both started loading. That wastes the
+memory and, observed here, killed the process. Fixed with double-checked
+locking: the cheap check outside the lock keeps the common path -- already
+loaded -- free of contention.
+
+**Index rebuilds raced.** Every participant sends `end_audio` within moments
+of the others, and each asks for a rebuild. Rebuilding rewrites one file and
+reassigns every `vector_id`, so two at once corrupt each other. Now
+serialised behind a lock, and deliberately *not* skipped when another
+rebuild has just finished: the other participant's rebuild may have run
+before this one's last utterance was written, and the work is idempotent, so
+doing it twice costs seconds while losing it once costs the end of the
+meeting.
+
+### One consequence to be aware of
+
+The room registry lives in memory, because it describes live connections
+that do not survive a restart and should not appear to. **That makes the
+server single-process.** Run two workers and each holds half of every room,
+so participants stop seeing each other. Fixing it means a shared broker --
+Redis pub/sub is the usual answer -- which is a real cost and not one worth
+paying at this size.
+
+---
+
 ## Known limitations
 
 Worth being able to name unprompted — being asked "what would you fix
@@ -972,8 +1070,10 @@ first?" and having a real answer is worth more than an unbroken defence.
    natural pauses, plus a rolling audio buffer with overlap — the same
    overlap idea used for text chunks, applied to audio.
 
-2. **No speaker diarization.** `speaker_id` exists in the schema and is
-   always NULL. Adding pyannote would populate it, at real CPU cost.
+2. **Speakers are identified per connection, not acoustically.** Which is
+   exact for remote participants and does nothing for several people
+   sharing one microphone in a room -- they are all attributed to whoever
+   owns the laptop. Acoustic diarization is the missing half; see §22. Adding pyannote would populate it, at real CPU cost.
 
 3. **A `sqlite3` connection is opened per WebSocket connection** and every
    insert commits individually. Fine for one client; at scale this needs

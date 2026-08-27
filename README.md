@@ -76,6 +76,7 @@ can seek to: `Special General Meeting @ 33:46-35:05`.
 | 4 | Action-item extraction into structured tasks | **Done** |
 | 5a | JWT authentication, meeting ownership | **Done** |
 | 5b | Web UI with live microphone capture | **Done** |
+| — | Multi-speaker meetings: who said what, from the login | **Done** |
 
 ## Stack
 
@@ -210,6 +211,29 @@ That guard matters more than it looks. On six windows of a governance
 discussion containing no action items at all, a naive prompt returned **33**
 of them; the prompt in [app/tasks.py](app/tasks.py) returned **0**. See §19
 of the design notes.
+
+### A meeting with several people
+
+Share the meeting id and anyone signed in can join it. Each participant
+streams their own microphone over their own authenticated connection, so
+**who said what comes from the login, not from guessing at the audio** —
+exact, where acoustic diarization is inferred.
+
+```
+0:00  Mariem Kbaier   So the next item is the notice period.
+0:08  Other Person    Right, let us go through the actions.
+0:11  Mariem Kbaier   Let us see what it comes back with.
+```
+
+Everyone sees one merged transcript, colour-coded by speaker. The
+interesting part is the clock: each connection measures time by counting its
+own audio samples, so a participant joining three minutes late would
+otherwise start at zero and interleave wrongly. The first speaker sets the
+meeting's origin and everyone else records their offset from it. See §22 of
+the design notes.
+
+It solves remote meetings exactly, and does **not** solve several people
+round one microphone — they are all attributed to whoever owns the laptop.
 
 ### Ask a question during the meeting
 
@@ -363,9 +387,9 @@ being read from while the model is still writing.
 pytest tests/ -q
 ```
 
-121 tests covering the document chunker, the transcript windower, question
+131 tests covering the document chunker, the transcript windower, question
 detection, audio segmentation, action-item verification, authentication,
-and the schema — the deterministic parts. Model behaviour is not
+multi-speaker meetings and the shared clock, and the schema — the deterministic parts. Model behaviour is not
 unit-tested; that belongs in evaluation against a labelled question set,
 which is a separate discipline.
 

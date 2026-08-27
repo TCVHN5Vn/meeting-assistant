@@ -93,6 +93,22 @@
     font-family:var(--mono); font-size:.72rem; color:var(--muted);
     flex:0 0 auto; font-variant-numeric:tabular-nums;
   }
+  /* Each speaker keeps one colour for the whole meeting, so the transcript
+     can be scanned as a conversation rather than read line by line. */
+  .line .who {
+    font-weight:600; flex:0 0 auto; font-size:.82rem;
+  }
+  .spk-0 { color:#0C6A67 } .spk-1 { color:#A25F09 } .spk-2 { color:#6A3FA0 }
+  .spk-3 { color:#1C5D9B } .spk-4 { color:#9C382C } .spk-5 { color:#3F7A2E }
+  @media (prefers-color-scheme: dark) {
+    .spk-0 { color:#4FC2BB } .spk-1 { color:#E0A245 } .spk-2 { color:#B69AE0 }
+    .spk-3 { color:#7FB6E8 } .spk-4 { color:#E58273 } .spk-5 { color:#8FD07A }
+  }
+  .room { display:flex; gap:6px; flex-wrap:wrap; align-items:center; }
+  .who-chip {
+    font-size:.72rem; padding:2px 8px; border-radius:10px;
+    border:1px solid var(--line-2); background:var(--sunken);
+  }
   .line.low .x { color:var(--muted); }
   .line.low .t::after { content:" ?"; color:var(--speech); }
   .empty { color:var(--muted); font-size:.88rem; font-style:italic; }
@@ -189,6 +205,7 @@
     <div class="pane-head">
       <span>Transcript</span>
       <span class="spacer" style="flex:1"></span>
+      <span class="room" id="room"></span>
       <span class="status" id="meeting-label"></span>
     </div>
     <div class="pane-body" id="transcript">
@@ -248,6 +265,19 @@ let meetingId = null;
 let ws = null;
 let audio = null;           // { ctx, stream, node }
 let currentAnswer = null;   // the <div> being streamed into
+
+// Speaker name -> a stable colour class, assigned in order of first
+// appearance so one person keeps one colour for the whole meeting.
+const speakerColours = new Map();
+function colourFor(name) {
+  if (!speakerColours.has(name)) speakerColours.set(name, `spk-${speakerColours.size % 6}`);
+  return speakerColours.get(name);
+}
+const inRoom = new Set();
+function renderRoom() {
+  $("room").innerHTML = [...inRoom].map(n =>
+    `<span class="who-chip ${colourFor(n)}">${escapeHtml(n)}</span>`).join("");
+}
 
 const $ = (id) => document.getElementById(id);
 const SAMPLE_RATE = 16000;
@@ -467,7 +497,15 @@ function stopRecording() {
 function handleServerEvent(message) {
   const { event, data } = JSON.parse(message.data);
   switch (event) {
-    case "authenticated":  $("conn-status").innerHTML = '<span class="rec-dot"></span>recording'; break;
+    case "authenticated":
+      $("conn-status").innerHTML = '<span class="rec-dot"></span>recording';
+      inRoom.add(data.name);
+      (data.others || []).forEach(n => inRoom.add(n));
+      renderRoom();
+      break;
+    case "participant_joined": inRoom.add(data.name); renderRoom(); break;
+    case "participant_left":   inRoom.delete(data.name); renderRoom(); break;
+    case "participant_speaking": break;
     case "transcript_chunk": addTranscriptLine(data); break;
     case "qa_listening":   showListening(data.question); break;
     case "qa_started":     startAnswer(data); break;
@@ -496,7 +534,7 @@ function timestamp(seconds) {
   return `${m}:${String(s).padStart(2, "0")}`;
 }
 
-function addTranscriptLine({ text, start_ts, confidence }) {
+function addTranscriptLine({ text, start_ts, confidence, speaker_name }) {
   const pane = $("transcript");
   pane.querySelector(".empty")?.remove();
 
@@ -508,10 +546,19 @@ function addTranscriptLine({ text, start_ts, confidence }) {
   const stamp = document.createElement("span");
   stamp.className = "t";
   stamp.textContent = timestamp(start_ts);
+
   const body = document.createElement("span");
   body.className = "x";
   body.textContent = text;
-  line.append(stamp, body);
+
+  if (speaker_name) {
+    const who = document.createElement("span");
+    who.className = `who ${colourFor(speaker_name)}`;
+    who.textContent = speaker_name;
+    line.append(stamp, who, body);
+  } else {
+    line.append(stamp, body);
+  }
   pane.append(line);
 
   // Only follow the transcript if the reader has not scrolled up to look at
@@ -566,6 +613,8 @@ function startAnswer({ question, trigger, sources, live_context_chars }) {
   const label = trigger === "wake_phrase" ? "asked out loud"
               : trigger === "typed" ? "typed" : trigger;
   block.innerHTML = `<div class="trigger">${label}${
+    arguments[0].asked_by ? ` &middot; ${escapeHtml(arguments[0].asked_by)}` : ""
+  }${
     live_context_chars ? ` &middot; using ${live_context_chars} chars of this meeting` : ""
   }</div>`;
 

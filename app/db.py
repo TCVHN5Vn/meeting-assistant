@@ -49,6 +49,34 @@ CREATE TABLE IF NOT EXISTS meetings (
     created_at  TEXT
 );
 
+-- Who was in the meeting, and when they arrived.
+--
+-- A meeting is a room people join, not a document one person owns. That
+-- distinction is what makes "who said this" answerable: identity comes from
+-- the authenticated connection the audio arrived on, not from guessing at
+-- the sound. It is how Teams and Zoom do it, and it is exact rather than
+-- inferred.
+CREATE TABLE IF NOT EXISTS meeting_participants (
+    meeting_id     TEXT REFERENCES meetings(id),
+    user_id        TEXT REFERENCES users(id),
+
+    -- Seconds between the meeting starting and this person's first word.
+    -- THE REASON THIS COLUMN EXISTS:
+    --
+    -- Each connection measures time by counting the audio samples it has
+    -- received, which is exact and cannot drift -- but it starts at zero
+    -- when THAT connection starts sending. Someone joining three minutes
+    -- late also starts at zero, so merging two transcripts naively
+    -- interleaves them completely wrongly.
+    --
+    -- Every participant's local clock is shifted by this offset to put it
+    -- on the meeting's timeline. All of it is measured server-side, so no
+    -- client clock is ever trusted.
+    joined_offset  REAL,
+    joined_at      TEXT,
+    PRIMARY KEY (meeting_id, user_id)
+);
+
 CREATE TABLE IF NOT EXISTS transcript_chunks (
     id          TEXT PRIMARY KEY,
     meeting_id  TEXT REFERENCES meetings(id),
@@ -190,7 +218,13 @@ CREATE INDEX IF NOT EXISTS idx_ragchunks_source ON rag_chunks(source_type, sourc
 # This is the smallest honest one -- SQLite has no ADD COLUMN IF NOT EXISTS,
 # so existing columns are read first and only the missing ones are added.
 ADDED_COLUMNS = {
-    "meetings": [("created_by", "TEXT REFERENCES users(id)")],
+    "meetings": [
+        ("created_by", "TEXT REFERENCES users(id)"),
+        # When the first participant started speaking. The origin of the
+        # meeting's shared timeline; every participant's offset is measured
+        # from it.
+        ("started_at", "TEXT"),
+    ],
 }
 
 
@@ -368,7 +402,7 @@ def get_user(conn, user_id: str):
 
 
 def user_can_access_meeting(conn, user_id: str, meeting_id: str) -> bool:
-    """Does this user own the meeting -- or is it unowned legacy data?
+    """May this user see the meeting: as owner, as participant, or legacy?
 
     Returns False for a meeting that does not exist, which is deliberate: the
     caller turns both cases into the same 404. Answering "not found" for
@@ -380,4 +414,75 @@ def user_can_access_meeting(conn, user_id: str, meeting_id: str) -> bool:
     ).fetchone()
     if row is None:
         return False
-    return row["created_by"] is None or row["created_by"] == user_id
+    if row["created_by"] is None or row["created_by"] == user_id:
+        return True
+
+    # Anyone who took part can read it back. Attending a meeting and then
+    # being unable to look at its transcript would be a strange rule.
+    return conn.execute(
+        """SELECT 1 FROM meeting_participants
+           WHERE meeting_id = ? AND user_id = ?""",
+        (meeting_id, user_id),
+    ).fetchone() is not None
+
+
+# --- Participants -------------------------------------------------------
+
+def meeting_started_at(conn, meeting_id: str):
+    """The origin of this meeting's timeline, as an ISO string, or None."""
+    row = conn.execute(
+        "SELECT started_at FROM meetings WHERE id = ?", (meeting_id,)).fetchone()
+    return row["started_at"] if row else None
+
+
+def start_meeting_clock(conn, meeting_id: str, when: str) -> str:
+    """Set the meeting's start time if it has none yet, and return it.
+
+    Set on the FIRST audio, not on the first connection: someone can open
+    the page and sit there for a minute before speaking, and starting the
+    clock then would put a minute of nothing at the front of the meeting.
+
+    COALESCE rather than a read-then-write, so two participants whose first
+    words arrive at the same moment cannot both set it.
+    """
+    conn.execute(
+        "UPDATE meetings SET started_at = COALESCE(started_at, ?) WHERE id = ?",
+        (when, meeting_id),
+    )
+    conn.commit()
+    return meeting_started_at(conn, meeting_id)
+
+
+def add_participant(conn, meeting_id: str, user_id: str, joined_offset: float) -> None:
+    conn.execute(
+        """INSERT OR IGNORE INTO meeting_participants
+           (meeting_id, user_id, joined_offset, joined_at) VALUES (?, ?, ?, ?)""",
+        (meeting_id, user_id, joined_offset, utc_now()),
+    )
+    conn.commit()
+
+
+def get_participants(conn, meeting_id: str) -> list[sqlite3.Row]:
+    return conn.execute(
+        """SELECT p.user_id, p.joined_offset, u.email, u.name
+           FROM meeting_participants p JOIN users u ON u.id = p.user_id
+           WHERE p.meeting_id = ? ORDER BY p.joined_offset""",
+        (meeting_id,),
+    ).fetchall()
+
+
+def get_transcript_with_speakers(conn, meeting_id: str) -> list[sqlite3.Row]:
+    """The transcript in spoken order, with each line attributed.
+
+    LEFT JOIN, not JOIN: lines recorded before speakers existed have a NULL
+    speaker_id, and an inner join would silently drop every one of them.
+    """
+    return conn.execute(
+        """SELECT c.id, c.text, c.start_ts, c.end_ts, c.confidence,
+                  c.speaker_id, u.name AS speaker_name, u.email AS speaker_email
+           FROM transcript_chunks c
+           LEFT JOIN users u ON u.id = c.speaker_id
+           WHERE c.meeting_id = ?
+           ORDER BY c.start_ts""",
+        (meeting_id,),
+    ).fetchall()
