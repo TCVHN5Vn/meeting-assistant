@@ -440,7 +440,32 @@ async function startAudio(onFrame) {
   silent.gain.value = 0;
   node.connect(silent).connect(ctx.destination);
 
-  return { ctx, stream, node };
+  // KEEP IT RUNNING WHEN THE TAB IS HIDDEN.
+  //
+  // Chrome suspends an AudioContext in a background tab when it is not
+  // producing audible sound -- and this one deliberately produces none, because
+  // routing the microphone to the speakers would echo it back into the room.
+  // So switching to another window silently stops capture: frames keep
+  // arriving at the server at the right rate, and every one of them is
+  // silence. Nothing errors, and the transcript simply stops.
+  //
+  // That matters most in exactly the case this feature exists for: two
+  // people in two windows, where somebody is always in the background.
+  const keepAwake = async () => {
+    if (ctx.state === "suspended") {
+      try {
+        await ctx.resume();
+        console.info("audio context resumed after being suspended");
+      } catch { /* the context is closing; stopRecording handles the rest */ }
+    }
+  };
+  document.addEventListener("visibilitychange", keepAwake);
+  // A timer as well as the event: the context can be suspended for reasons
+  // that never fire visibilitychange, and a two-second check is cheap next
+  // to losing a meeting.
+  const wakeTimer = setInterval(keepAwake, 2000);
+
+  return { ctx, stream, node, keepAwake, wakeTimer };
 }
 
 // ===================================================================
@@ -479,8 +504,25 @@ async function startRecording() {
       stopRecording();
     };
 
+    let silentFrames = 0;
     audio = await startAudio((buffer) => {
-      if (ws && ws.readyState === WebSocket.OPEN) ws.send(buffer);
+      if (!ws || ws.readyState !== WebSocket.OPEN) return;
+      ws.send(buffer);
+
+      // Watch our own signal. A microphone that has been muted, taken by
+      // another application, or suspended by the browser sends perfect
+      // silence -- indistinguishable from a quiet room, except that it
+      // never stops.
+      const samples = new Int16Array(buffer);
+      let peak = 0;
+      for (let i = 0; i < samples.length; i += 16) peak = Math.max(peak, Math.abs(samples[i]));
+      silentFrames = peak < 100 ? silentFrames + 1 : 0;
+      if (silentFrames === 20) {
+        $("conn-status").innerHTML =
+          '<span class="rec-dot"></span>recording &mdash; but hearing nothing';
+      } else if (silentFrames === 0 && $("conn-status").textContent.includes("nothing")) {
+        $("conn-status").innerHTML = '<span class="rec-dot"></span>recording';
+      }
     });
 
     document.body.classList.add("recording");
@@ -500,6 +542,8 @@ async function startRecording() {
 
 function stopRecording() {
   if (audio) {
+    clearInterval(audio.wakeTimer);
+    document.removeEventListener("visibilitychange", audio.keepAwake);
     audio.stream.getTracks().forEach((track) => track.stop());
     audio.node.disconnect();
     audio.ctx.close();

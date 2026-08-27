@@ -47,9 +47,9 @@ async def lifespan(app: FastAPI):
     """
     db.init_db().close()
     asr.get_model()
-    print("Server ready.")
+    print("Server ready.", flush=True)
     yield
-    print("Server shutting down.")
+    print("Server shutting down.", flush=True)
 
 
 app = FastAPI(title="Meeting Assistant", lifespan=lifespan)
@@ -314,6 +314,13 @@ class LiveSession:
         # word. Set on the first audio frame; see _ensure_on_the_clock.
         self.joined_offset: float | None = None
 
+        # Diagnostics. With several participants the only question that
+        # matters when something goes quiet is "is audio still arriving on
+        # this connection?", and without a count there is no way to tell a
+        # silent microphone from a stalled one.
+        self.frames_in = 0
+        self.samples_in = 0
+
         # Accumulates the incoming stream and cuts it at pauses rather than
         # on a stopwatch. It also owns the meeting clock: every utterance
         # carries an absolute start time derived from the total number of
@@ -359,6 +366,17 @@ class LiveSession:
         await self._ensure_on_the_clock()
 
         pcm = np.frombuffer(frame, dtype=np.int16).astype(np.float32) / 32768.0
+        self.frames_in += 1
+        self.samples_in += len(pcm)
+
+        # Every ~15s, per connection: how much audio has arrived and how
+        # loud it is. A connection that has gone quiet and one that is
+        # sending silence look identical from the transcript alone.
+        if self.frames_in % 15 == 0:
+            peak = float(np.abs(pcm).max()) if len(pcm) else 0.0
+            print(f"[{self.meeting_id}] {self.speaker_name}: "
+                  f"{self.samples_in / 16000:.0f}s audio received, "
+                  f"peak {peak:.3f}{'  <- SILENT' if peak < 0.01 else ''}", flush=True)
 
         # Runs on the event loop rather than a worker thread, and that is a
         # measured decision, not an oversight. The detector costs ~0.1ms per
@@ -407,7 +425,7 @@ class LiveSession:
         db.add_participant(self.conn, self.meeting_id, self.speaker_id,
                            self.joined_offset)
         print(f"[{self.meeting_id}] {self.speaker_name} joined the timeline "
-              f"at +{self.joined_offset:.1f}s")
+              f"at +{self.joined_offset:.1f}s", flush=True)
 
         await broadcast(self.meeting_id, "participant_speaking",
                         user_id=self.speaker_id, name=self.speaker_name,
@@ -421,9 +439,9 @@ class LiveSession:
         longer anyone to send it to. Persisting and notifying are separate
         concerns and only one of them needs a live socket.
         """
-        print(f"[{self.meeting_id}] utterance {utterance.start:.1f}-"
-              f"{utterance.end:.1f}s ({utterance.duration:.1f}s, cut on "
-              f"{utterance.reason})")
+        print(f"[{self.meeting_id}] {self.speaker_name}: utterance "
+              f"{utterance.start:.1f}-{utterance.end:.1f}s "
+              f"({utterance.duration:.1f}s, cut on {utterance.reason})", flush=True)
 
         # Whisper inference is CPU-bound and takes seconds. Called directly it
         # would run ON the event loop thread and freeze the entire server.
@@ -538,11 +556,11 @@ class LiveSession:
             async with INDEX_LOCK:
                 windows = await asyncio.to_thread(work)
         except Exception as exc:  # noqa: BLE001 - never kill the session for this
-            print(f"[{self.meeting_id}] indexing failed: {exc!r}")
+            print(f"[{self.meeting_id}] indexing failed: {exc!r}", flush=True)
             await self.send("indexing_failed", message=str(exc))
             return
 
-        print(f"[{self.meeting_id}] indexed {windows} window(s)")
+        print(f"[{self.meeting_id}] indexed {windows} window(s)", flush=True)
         await self.send("indexed", windows=windows)
 
     async def _note_question(self, question: str, trigger: str) -> None:
@@ -647,10 +665,10 @@ class LiveSession:
             return
         exc = task.exception()
         if exc is not None:
-            print(f"[{self.meeting_id}] answer task failed: {exc!r}")
+            print(f"[{self.meeting_id}] answer task failed: {exc!r}", flush=True)
 
     async def _answer(self, question: str, trigger: str) -> None:
-        print(f"[{self.meeting_id}] answering ({trigger}): {question!r}")
+        print(f"[{self.meeting_id}] answering ({trigger}): {question!r}", flush=True)
 
         try:
             # Retrieval and prompt assembly are blocking (embedding the query,
@@ -712,7 +730,7 @@ class LiveSession:
             # belongs in the database.
             await self.flush_audio(notify=False)
         except Exception as exc:  # noqa: BLE001 - best effort on a dead socket
-            print(f"[{self.meeting_id}] could not flush final utterance: {exc!r}")
+            print(f"[{self.meeting_id}] could not flush final utterance: {exc!r}", flush=True)
 
         if self.pending_timer and not self.pending_timer.done():
             self.pending_timer.cancel()
@@ -872,7 +890,7 @@ async def ws_meeting(websocket: WebSocket, meeting_id: str):
                 await session.handle_text(text)
 
     except WebSocketDisconnect:
-        print(f"[{meeting_id}] {user['email']} left")
+        print(f"[{meeting_id}] {user['email']} left", flush=True)
     finally:
         # Leave the room BEFORE closing, so nothing tries to broadcast to a
         # socket that is on its way out.
