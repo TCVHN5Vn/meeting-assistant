@@ -206,6 +206,7 @@
       <span>Transcript</span>
       <span class="spacer" style="flex:1"></span>
       <span class="room" id="room"></span>
+      <button id="copy-link" class="hidden" title="Copy the link so someone else can join">Copy invite link</button>
       <span class="status" id="meeting-label"></span>
     </div>
     <div class="pane-body" id="transcript">
@@ -333,8 +334,28 @@ function signOut() {
 }
 $("signout").addEventListener("click", signOut);
 
+$("copy-link").addEventListener("click", async () => {
+  const link = `${location.origin}/#${meetingId}`;
+  try {
+    await navigator.clipboard.writeText(link);
+    $("copy-link").textContent = "Copied";
+  } catch {
+    // Clipboard access needs a secure context, which plain http://localhost
+    // sometimes is not. Falling back to showing the link is better than a
+    // button that silently does nothing.
+    $("meeting-label").textContent = link;
+    $("copy-link").textContent = "Select the link and copy it";
+  }
+  setTimeout(() => ($("copy-link").textContent = "Copy invite link"), 2500);
+});
+
 function showApp(email) {
   $("who").textContent = email;
+  const invited = location.hash.replace(/^#/, "").trim();
+  if (invited) {
+    $("meeting-label").textContent = `joining meeting ${invited.slice(0, 8)}`;
+    $("record").textContent = "Join and start recording";
+  }
   $("login").classList.add("hidden");
   $("app").classList.remove("hidden");
   $("app-header").classList.remove("hidden");
@@ -430,7 +451,16 @@ $("record").addEventListener("click", () => (ws ? stopRecording() : startRecordi
 async function startRecording() {
   $("record").disabled = true;
   $("conn-status").textContent = "connecting…";
-  meetingId = crypto.randomUUID();
+  // The URL fragment IS the invitation. Someone opening
+  // http://localhost:8000/#<id> joins that meeting instead of starting a
+  // new one -- which is how a Zoom or Teams link behaves, and means
+  // inviting somebody is copying the address bar.
+  //
+  // A fragment rather than a query string on purpose: fragments are never
+  // sent to the server, so the meeting id stays out of access logs.
+  const fromLink = location.hash.replace(/^#/, "").trim();
+  meetingId = fromLink || crypto.randomUUID();
+  location.hash = meetingId;
 
   try {
     ws = new WebSocket(`ws://${location.host}/ws/meetings/${meetingId}`);
@@ -458,6 +488,7 @@ async function startRecording() {
     $("record").className = "danger";
     $("conn-status").innerHTML = '<span class="rec-dot"></span>recording';
     $("meeting-label").textContent = `meeting ${meetingId.slice(0, 8)}`;
+    $("copy-link").classList.remove("hidden");
     $("transcript").innerHTML = "";
   } catch (error) {
     $("conn-status").textContent = error.message;

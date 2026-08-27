@@ -214,7 +214,13 @@ of the design notes.
 
 ### A meeting with several people
 
-Share the meeting id and anyone signed in can join it. Each participant
+**The URL fragment is the invitation.** Start a meeting and the address bar
+becomes `http://localhost:8000/#<meeting-id>` — send that to someone and
+they join yours instead of starting their own. A fragment rather than a
+query string on purpose: fragments are never sent to the server, so the
+meeting id stays out of access logs.
+
+Anyone signed in who holds the link can join. Each participant
 streams their own microphone over their own authenticated connection, so
 **who said what comes from the login, not from guessing at the audio** —
 exact, where acoustic diarization is inferred.
