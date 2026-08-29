@@ -1,0 +1,117 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+# A second push while the first is still running makes the first irrelevant.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # ---------------------------------------------------------------------
+  # The fast job. Runs on every push, finishes in well under a minute.
+  #
+  # It can be this fast because the test suite never touches a model: the
+  # audio segmenter takes its detector as an argument, and the embedding and
+  # language models sit behind lazy imports. What is tested is the logic
+  # around them -- where to cut audio, what to reject, who may see what --
+  # which is deterministic and needs no ML stack at all.
+  # ---------------------------------------------------------------------
+  tests:
+    name: tests (${{ matrix.python }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # 3.12 is what this is developed on. 3.13 is there to find out
+        # before a user does.
+        python: ["3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+          cache: pip
+          cache-dependency-path: requirements-test.txt
+
+      - name: Install test dependencies
+        run: pip install -r requirements-test.txt
+
+      - name: Run the suite
+        run: pytest tests/ -q
+
+  # ---------------------------------------------------------------------
+  # The slow job. Installs everything -- torch, faiss, faster-whisper,
+  # sentence-transformers -- and checks the application still imports.
+  #
+  # It catches what the fast job structurally cannot: a dependency that has
+  # released a breaking change, or an import that only exists on this
+  # machine. It downloads no model weights, so it stays minutes rather than
+  # tens of minutes.
+  # ---------------------------------------------------------------------
+  full-install:
+    name: full install imports cleanly
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: requirements.txt
+
+      - name: Install everything
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq ffmpeg
+          pip install -r requirements.txt
+
+      - name: Import every module
+        # Importing is the check. Model weights are downloaded lazily on
+        # first use, so nothing here pulls a gigabyte.
+        run: |
+          python - <<'PY'
+          import importlib, pkgutil, sys
+          failed = []
+          for pkg in ("app", "scripts"):
+              for mod in pkgutil.walk_packages([pkg], prefix=f"{pkg}."):
+                  try:
+                      importlib.import_module(mod.name)
+                      print(f"ok   {mod.name}")
+                  except Exception as exc:
+                      failed.append(f"{mod.name}: {exc!r}")
+                      print(f"FAIL {mod.name}: {exc!r}")
+          if failed:
+              sys.exit("\n".join(failed))
+          PY
+
+  # ---------------------------------------------------------------------
+  # Cheap insurance. A credential committed to a public repository is
+  # compromised the moment it is pushed, and no amount of rewriting history
+  # afterwards puts it back.
+  # ---------------------------------------------------------------------
+  secrets:
+    name: no credentials committed
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0     # scan the whole history, not just the tip
+
+      - name: Scan for credential patterns
+        run: |
+          set +e
+          PATTERNS='ghp_[A-Za-z0-9]{30,}|github_pat_[A-Za-z0-9_]{20,}|sk-[A-Za-z0-9]{32,}|AKIA[0-9A-Z]{16}|-----BEGIN [A-Z ]*PRIVATE KEY-----'
+          # Search the tracked tree and every commit's contents.
+          HITS=$(git grep -InE "$PATTERNS" $(git rev-list --all) -- 2>/dev/null | head -20)
+          if [ -n "$HITS" ]; then
+            echo "::error::Credential-shaped strings found in the repository history:"
+            echo "$HITS"
+            exit 1
+          fi
+          echo "No credential patterns found in any commit."

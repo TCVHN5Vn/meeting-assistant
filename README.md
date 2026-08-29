@@ -1,5 +1,7 @@
 # Multimodal Meeting Assistant
 
+[![CI](https://github.com/TCVHN5Vn/meeting-assistant/actions/workflows/ci.yml/badge.svg)](https://github.com/TCVHN5Vn/meeting-assistant/actions/workflows/ci.yml)
+
 A meeting assistant that transcribes audio in real time, stores structured
 transcripts, and answers questions about company documents using retrieval-
 augmented generation — **running entirely on the local machine**. No API
@@ -409,8 +411,15 @@ being read from while the model is still writing.
 ## Tests
 
 ```bash
-pytest tests/ -q
+pytest tests/ -q                       # everything
+pip install -r requirements-test.txt   # or just enough to run them
 ```
+
+**The suite needs no ML stack.** No torch, no faiss, no Whisper — five
+packages and it runs in seconds. That is not an accident: the audio
+segmenter takes its detector as an argument, and the embedding and language
+models sit behind lazy imports, so what is tested is the deterministic logic
+around them. CI installs in seconds rather than minutes as a result.
 
 131 tests covering the document chunker, the transcript windower, question
 detection, audio segmentation, action-item verification, authentication,

@@ -1,0 +1,16 @@
+# Just enough to run the test suite.
+#
+# The suite deliberately does not touch a model: the audio segmenter takes
+# its detector as an argument, the embedding and language models are behind
+# lazy imports, and what is tested is the logic around them -- where to cut,
+# what to reject, who may see what. So none of torch, faiss, faster-whisper
+# or sentence-transformers is needed here, and CI installs in seconds rather
+# than minutes.
+#
+# app/server.py and app/asr.py are NOT importable with only these; the
+# "full install" job in CI is what covers those.
+pytest>=8.0
+numpy>=1.26        # the VAD segmenter works on sample arrays
+bcrypt>=4.1        # password hashing tests
+pyjwt>=2.8         # token tests
+httpx>=0.27        # imported by the Ollama client, which app/tasks.py pulls in
