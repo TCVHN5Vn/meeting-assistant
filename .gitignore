@@ -27,6 +27,7 @@ sample_data/audio/
 # A long-form explanation of the project, useful on this machine and not
 # something to publish. Untracked rather than deleted.
 docs/PROJECT-GUIDE.md
+docs/DEMO-SPEECH.md
 
 # --- Secrets ---
 .env
