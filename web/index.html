@@ -194,6 +194,11 @@
 <header class="hidden" id="app-header">
   <h1>Meeting Assistant</h1>
   <button id="record" class="primary">Start recording</button>
+  <label class="status" for="audio-file"
+         title="Use an audio file instead of the microphone. Two tabs cannot share one microphone, so this is how you rehearse a multi-person meeting on one machine.">
+    or <input type="file" id="audio-file" accept="audio/*"
+              style="width:auto;display:inline-block;padding:3px 6px;font-size:.78rem">
+  </label>
   <span class="status" id="conn-status"></span>
   <span class="spacer"></span>
   <span class="who" id="who"></span>
@@ -265,6 +270,7 @@ let token = store.getItem("token");
 let meetingId = null;
 let ws = null;
 let audio = null;           // { ctx, stream, node }
+let fileSource = null;      // an audio file standing in for the microphone
 let currentAnswer = null;   // the <div> being streamed into
 
 // Speaker name -> a stable colour class, assigned in order of first
@@ -403,8 +409,43 @@ class PCMFrames extends AudioWorkletProcessor {
 registerProcessor("pcm-frames", PCMFrames);
 `;
 
+async function streamFromFile(file) {
+  // Decoded at 16 kHz so the samples reaching the worklet are identical to
+  // the microphone's, then played into a MediaStreamDestination -- which
+  // yields a real MediaStream the rest of startAudio cannot tell apart from
+  // a device.
+  const ctx = new AudioContext({ sampleRate: SAMPLE_RATE });
+  // A context created without a getUserMedia call starts SUSPENDED, because
+  // nothing has granted this page permission to make sound. The microphone
+  // path never hits this: asking for the microphone is itself the gesture
+  // that unlocks audio. Here nothing does, so it has to be asked for --
+  // otherwise the graph never runs and not one frame is produced.
+  if (ctx.state === "suspended") await ctx.resume();
+  const buffer = await ctx.decodeAudioData(await file.arrayBuffer());
+  const destination = ctx.createMediaStreamDestination();
+  const source = ctx.createBufferSource();
+  source.buffer = buffer;
+  source.loop = true;             // so a short clip outlasts the meeting
+  source.connect(destination);
+  source.start();
+  return destination.stream;
+}
+
 async function startAudio(onFrame) {
-  const stream = await navigator.mediaDevices.getUserMedia({
+  // A FILE INSTEAD OF THE MICROPHONE.
+  //
+  // Two browser tabs cannot share one physical microphone: the second to
+  // open it takes the device, and the first keeps receiving frames of pure
+  // silence. Nothing errors, so it looks as though the app stopped
+  // listening. It is the operating system, not this code -- with Chrome's
+  // fake device both tabs capture happily, at peak 0.65 and 0.70.
+  //
+  // That makes a two-person meeting impossible to rehearse on one machine,
+  // which is exactly when you most want to. Everything below this line
+  // stays the production path.
+  const stream = fileSource
+    ? await streamFromFile(fileSource)
+    : await navigator.mediaDevices.getUserMedia({
     audio: {
       channelCount: 1,
       // The browser's own cleanup, before anything of ours sees the signal.
@@ -424,6 +465,10 @@ async function startAudio(onFrame) {
     await ctx.close();
     throw new Error(`browser gave ${ctx.sampleRate} Hz, not ${SAMPLE_RATE} Hz`);
   }
+
+  // Same reason as in streamFromFile: with a file standing in for the
+  // microphone, nothing has unlocked audio for this page.
+  if (ctx.state === "suspended") await ctx.resume();
 
   const url = URL.createObjectURL(new Blob([WORKLET], { type: "application/javascript" }));
   await ctx.audioWorklet.addModule(url);
@@ -471,6 +516,12 @@ async function startAudio(onFrame) {
 // ===================================================================
 // Recording session
 // ===================================================================
+$("audio-file").addEventListener("change", (event) => {
+  fileSource = event.target.files[0] || null;
+  $("record").textContent = fileSource ? "Start (from file)"
+    : (location.hash ? "Join and start recording" : "Start recording");
+});
+
 $("record").addEventListener("click", () => (ws ? stopRecording() : startRecording()));
 
 async function startRecording() {
@@ -524,6 +575,11 @@ async function startRecording() {
         $("conn-status").innerHTML = '<span class="rec-dot"></span>recording';
       }
     });
+
+    if (audio.ctx.state !== "running") {
+      $("conn-status").textContent =
+        `audio is ${audio.ctx.state} \u2014 click the page and press record again`;
+    }
 
     document.body.classList.add("recording");
     $("record").textContent = "Stop recording";
@@ -634,7 +690,26 @@ function addTranscriptLine({ text, start_ts, confidence, speaker_name }) {
   } else {
     line.append(stamp, body);
   }
-  pane.append(line);
+
+  // INSERT BY TIME, NOT BY ARRIVAL.
+  //
+  // With one speaker these are the same thing, so appending was fine.
+  // With several they are not: each participant's audio is transcribed
+  // independently and finishes whenever it finishes, so a line spoken at
+  // 0:08 can arrive after one spoken at 0:19. Appending puts the meeting
+  // in the order the server happened to finish work, which reads as two
+  // monologues rather than a conversation.
+  //
+  // Scanning backwards because a late line is almost always near the end,
+  // so the loop exits after a step or two.
+  line.dataset.ts = start_ts;
+  const existing = pane.querySelectorAll(".line");
+  let before = null;
+  for (let i = existing.length - 1; i >= 0; i--) {
+    if (parseFloat(existing[i].dataset.ts) <= start_ts) break;
+    before = existing[i];
+  }
+  pane.insertBefore(line, before);
 
   // Only follow the transcript if the reader has not scrolled up to look at
   // something. Yanking the view away mid-read is the classic log-tail sin.

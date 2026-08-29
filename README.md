@@ -238,6 +238,25 @@ otherwise start at zero and interleave wrongly. The first speaker sets the
 meeting's origin and everyone else records their offset from it. See §22 of
 the design notes.
 
+### Testing it on one machine
+
+**Two browser tabs cannot share one microphone.** The second to open it
+takes the device and the first receives frames of pure silence — nothing
+errors, the transcript simply stops. That is the operating system, not this
+code: with a synthetic device both tabs capture happily.
+
+So each window can use an **audio file instead of the microphone** — pick
+one next to the record button. It is decoded to 16 kHz and played into a
+`MediaStreamDestination`, which produces a real `MediaStream`; every layer
+below that is the production path.
+
+```
+0:08  Other Person    Right, let us go through the actions.
+0:11  Mariem Kbaier   Let us see what it comes back with.
+0:12  Other Person    Karen, can you circulate the revised benchmark?
+0:13  Mariem Kbaier   And then we can move on to the financial report.
+```
+
 It solves remote meetings exactly, and does **not** solve several people
 round one microphone — they are all attributed to whoever owns the laptop.
 
